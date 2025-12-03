@@ -7,5 +7,11 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
 
+# Build if needed
+if [ ! -f "target/release/pqc-gui" ]; then
+    echo "Building PQC Chat GUI..."
+    cargo build --release --bin pqc-gui --features gui
+fi
+
 echo "Starting PQC Chat Client..."
-python3 -m gui.main_window "$@"
+./target/release/pqc-gui "$@"

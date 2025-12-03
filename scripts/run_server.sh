@@ -13,5 +13,11 @@ if [ ! -f "server.crt" ] || [ ! -f "server.key" ]; then
     "$SCRIPT_DIR/generate_certs.sh" .
 fi
 
+# Build if needed
+if [ ! -f "target/release/pqc-server" ]; then
+    echo "Building PQC Chat Server..."
+    cargo build --release --bin pqc-server
+fi
+
 echo "Starting PQC Chat Server..."
-python3 run_server.py "$@"
+./target/release/pqc-server "$@"

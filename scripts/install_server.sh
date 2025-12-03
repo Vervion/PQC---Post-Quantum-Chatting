@@ -21,7 +21,14 @@ SERVICE_USER="pqc-chat"
 # Install dependencies
 echo "Installing dependencies..."
 apt-get update
-apt-get install -y python3 python3-pip openssl
+apt-get install -y openssl build-essential pkg-config libssl-dev
+
+# Install Rust if not present
+if ! command -v cargo &> /dev/null; then
+    echo "Installing Rust..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source "$HOME/.cargo/env"
+fi
 
 # Create service user
 echo "Creating service user..."
@@ -31,23 +38,26 @@ fi
 
 # Create directories
 echo "Creating directories..."
-mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR/bin"
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$LOG_DIR"
 
-# Copy application files
-echo "Installing application files..."
+# Build application
+echo "Building PQC Chat Server..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-cp -r "$PROJECT_DIR/server" "$INSTALL_DIR/"
-cp -r "$PROJECT_DIR/client" "$INSTALL_DIR/"
-cp "$PROJECT_DIR/run_server.py" "$INSTALL_DIR/" 2>/dev/null || echo "Note: run_server.py not found, will need to create"
+cd "$PROJECT_DIR"
+cargo build --release --bin pqc-server
+
+# Install binary
+echo "Installing application..."
+cp "$PROJECT_DIR/target/release/pqc-server" "$INSTALL_DIR/bin/"
 
 # Install configuration
 echo "Installing configuration..."
-if [ ! -f "$CONFIG_DIR/server.conf" ]; then
-    cp "$PROJECT_DIR/config/server.conf" "$CONFIG_DIR/"
+if [ ! -f "$CONFIG_DIR/server.toml" ]; then
+    cp "$PROJECT_DIR/config/server.toml" "$CONFIG_DIR/"
 fi
 
 # Generate TLS certificates if not present
@@ -67,6 +77,7 @@ chown -R root:root "$INSTALL_DIR"
 chown -R root:"$SERVICE_USER" "$CONFIG_DIR"
 chmod 750 "$CONFIG_DIR"
 chmod 640 "$CONFIG_DIR"/*
+chmod 755 "$INSTALL_DIR/bin/pqc-server"
 
 # Install systemd service
 echo "Installing systemd service..."
@@ -85,5 +96,5 @@ echo ""
 echo "To check status:"
 echo "  sudo systemctl status pqc-chat-server"
 echo ""
-echo "Configuration file: $CONFIG_DIR/server.conf"
+echo "Configuration file: $CONFIG_DIR/server.toml"
 echo "Log file: $LOG_DIR/server.log"

@@ -1,16 +1,16 @@
 [Unit]
 Description=PQC Chat Server - Post-Quantum Secure Chat
-Documentation=https://github.com/your-org/pqc-chat
+Documentation=https://github.com/Vervion/PQC---Post-Quantum-Chatting
 After=network.target
 
 [Service]
 Type=simple
 User=pqc-chat
 Group=pqc-chat
-WorkingDirectory=/opt/pqc-chat
+WorkingDirectory=/etc/pqc-chat
 
-# Main server process
-ExecStart=/usr/bin/python3 /opt/pqc-chat/run_server.py --config /etc/pqc-chat/server.conf
+# Main server process (Rust binary)
+ExecStart=/opt/pqc-chat/bin/pqc-server --config /etc/pqc-chat/server.toml
 
 # Restart configuration
 Restart=on-failure

@@ -1,6 +1,6 @@
 [Unit]
 Description=PQC Chat Client - Post-Quantum Secure Chat
-Documentation=https://github.com/your-org/pqc-chat
+Documentation=https://github.com/Vervion/PQC---Post-Quantum-Chatting
 After=network.target graphical.target
 
 [Service]
@@ -12,8 +12,8 @@ WorkingDirectory=/opt/pqc-chat
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/%I/.Xauthority
 
-# Main client process
-ExecStart=/usr/bin/python3 /opt/pqc-chat/gui/main_window.py
+# Main client process (Rust binary)
+ExecStart=/opt/pqc-chat/bin/pqc-gui
 
 # Restart configuration
 Restart=on-failure

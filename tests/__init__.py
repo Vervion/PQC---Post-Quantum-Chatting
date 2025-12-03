@@ -1,3 +1,3 @@
 """
-Tests for PQC Chat Server and Client
+PQC Chat Python Tests Package
 """

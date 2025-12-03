@@ -2,69 +2,76 @@
 
 A LAN-based, post-quantum secure audio/video chat system designed to run on Raspberry Pis.
 
+**Built with Rust and Kyber post-quantum cryptography.**
+
 ## Overview
 
 This project implements a secure audio/video chat system with the following features:
+- **Kyber1024 post-quantum key exchange** for quantum-resistant encryption
 - TLS 1.3 encrypted signaling channel
 - DTLS-SRTP encrypted media transport (stub implementation)
 - Room-based chat system
-- Python tkinter GUI client
+- Native egui GUI client
 - Designed for Raspberry Pi deployment
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    PQC Chat Server                       │
-│  ┌─────────────────┐  ┌─────────────┐  ┌─────────────┐  │
-│  │  TLS Listener   │  │    Room     │  │   Media     │  │
-│  │  (Signaling)    │  │   Manager   │  │  Forwarder  │  │
-│  └────────┬────────┘  └──────┬──────┘  └──────┬──────┘  │
-│           │                  │                │          │
-│           └──────────────────┴────────────────┘          │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    PQC Chat Server (Rust)                   │
+│  ┌─────────────────┐  ┌─────────────┐  ┌─────────────────┐  │
+│  │  TLS Listener   │  │    Room     │  │   Media         │  │
+│  │  + Kyber KEM    │  │   Manager   │  │   Forwarder     │  │
+│  └────────┬────────┘  └──────┬──────┘  └───────┬─────────┘  │
+│           │                  │                 │            │
+│           └──────────────────┴─────────────────┘            │
+└─────────────────────────────────────────────────────────────┘
                            │
-                    TLS/DTLS-SRTP
+                    TLS + Kyber / DTLS-SRTP
                            │
-┌─────────────────────────────────────────────────────────┐
-│                    PQC Chat Client                       │
-│  ┌─────────────────┐  ┌─────────────┐  ┌─────────────┐  │
-│  │   Signaling     │  │  AV Capture │  │   Media     │  │
-│  │    Client       │  │   (Stubs)   │  │  Transport  │  │
-│  └────────┬────────┘  └──────┬──────┘  └──────┬──────┘  │
-│           │                  │                │          │
-│           └──────────────────┴────────────────┘          │
-│                          │                               │
-│                   ┌──────┴──────┐                        │
-│                   │  Python GUI │                        │
-│                   └─────────────┘                        │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    PQC Chat Client (Rust)                   │
+│  ┌─────────────────┐  ┌─────────────┐  ┌─────────────────┐  │
+│  │   Signaling     │  │  AV Capture │  │   Media         │  │
+│  │   + Kyber KEM   │  │   (Stubs)   │  │   Transport     │  │
+│  └────────┬────────┘  └──────┬──────┘  └───────┬─────────┘  │
+│           │                  │                 │            │
+│           └──────────────────┴─────────────────┘            │
+│                          │                                  │
+│                   ┌──────┴──────┐                           │
+│                   │  egui GUI   │                           │
+│                   └─────────────┘                           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Components
 
-### Server (`server/`)
-- **tls_listener.py**: TCP TLS listener for signaling connections
-- **room_manager.py**: Room creation, joining, and participant management
-- **media_forwarder.py**: DTLS-SRTP media forwarding (stub implementation)
-- **server.py**: Main server coordinating all components
+### Server (`src/server/`)
+- **main.rs**: TCP TLS listener with Kyber key exchange for signaling connections
+- Async Tokio runtime for high performance
+- Post-quantum key exchange using Kyber1024
 
-### Client (`client/`)
-- **signaling_client.py**: TLS signaling connection to server
-- **av_capture.py**: Audio/video capture stubs
-- **media_transport.py**: DTLS-SRTP media sender/receiver stubs
-- **client_engine.py**: Main client engine
+### Client (`src/client/`)
+- **main.rs**: TLS signaling client with Kyber key exchange
+- Command-line interface for testing
 
-### GUI (`gui/`)
-- **main_window.py**: tkinter-based GUI with controls for:
+### GUI (`src/gui/`)
+- **main.rs**: egui-based native GUI with controls for:
   - Server connection
   - Room browsing and creation
   - Joining/leaving rooms
   - Audio/video toggle
 
+### Library (`src/`)
+- **crypto/kyber.rs**: Kyber1024 key encapsulation mechanism
+- **protocol.rs**: JSON signaling message definitions
+- **room.rs**: Room and participant management
+- **media.rs**: DTLS-SRTP media handling stubs
+- **config.rs**: Configuration structures
+
 ### Configuration (`config/`)
-- **server.conf**: Server configuration template
-- **client.conf**: Client configuration template
+- **server.toml**: Server configuration (TOML format)
+- **client.toml**: Client configuration (TOML format)
 
 ### Scripts (`scripts/`)
 - **install_server.sh**: Server installation for Raspberry Pi
@@ -81,31 +88,40 @@ This project implements a secure audio/video chat system with the following feat
 
 ### Prerequisites
 
-- Python 3.8+
-- OpenSSL (for certificate generation)
-- tkinter (for GUI)
+- Rust 1.70+ (install via https://rustup.rs/)
+- OpenSSL development libraries
+- For GUI: X11/Wayland development libraries
 
 ### Development Setup
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/your-org/pqc-chat.git
-   cd pqc-chat
+   git clone https://github.com/Vervion/PQC---Post-Quantum-Chatting.git
+   cd PQC---Post-Quantum-Chatting
    ```
 
-2. Generate TLS certificates:
+2. Build the project:
+   ```bash
+   cargo build --release
+   ```
+
+3. Generate TLS certificates:
    ```bash
    ./scripts/generate_certs.sh
    ```
 
-3. Run the server:
+4. Run the server:
    ```bash
-   python3 run_server.py
+   ./target/release/pqc-server
+   # Or use the script:
+   ./scripts/run_server.sh
    ```
 
-4. Run the client (in another terminal):
+5. Run the client (in another terminal):
    ```bash
-   python3 -m gui.main_window
+   ./target/release/pqc-client --host 127.0.0.1
+   # Or run the GUI:
+   ./target/release/pqc-gui
    ```
 
 ### Raspberry Pi Installation
@@ -120,54 +136,64 @@ sudo systemctl start pqc-chat-server
 #### Client Installation
 ```bash
 sudo ./scripts/install_client.sh
-# Edit /etc/pqc-chat/client.conf with server address
-python3 /opt/pqc-chat/gui/main_window.py
+# Edit /etc/pqc-chat/client.toml with server address
+/opt/pqc-chat/bin/pqc-gui
 ```
 
 ## Running Tests
 
 ```bash
-python3 -m pytest tests/
-# Or run individual test files:
-python3 -m unittest tests/test_room_manager.py
-python3 -m unittest tests/test_media_forwarder.py
-python3 -m unittest tests/test_av_capture.py
-python3 -m unittest tests/test_media_transport.py
+# Run Rust unit tests
+cargo test
+
+# Run Python integration tests
+python3 -m unittest discover tests/
 ```
 
 ## Configuration
 
-### Server Configuration (`config/server.conf`)
+### Server Configuration (`config/server.toml`)
 
-```ini
-[server]
-signaling_host = 0.0.0.0
+```toml
+signaling_host = "0.0.0.0"
 signaling_port = 8443
 audio_port = 10000
 video_port = 10001
-
-[tls]
-certfile = /etc/pqc-chat/server.crt
-keyfile = /etc/pqc-chat/server.key
+certfile = "server.crt"
+keyfile = "server.key"
+default_max_participants = 10
+log_level = "info"
 ```
 
-### Client Configuration (`config/client.conf`)
+### Client Configuration (`config/client.toml`)
 
-```ini
-[server]
-host = 192.168.1.100
+```toml
+server_host = "192.168.1.100"
 signaling_port = 8443
-
-[user]
-username = MyRaspberryPi
+default_username = "RaspberryPi"
+log_level = "info"
 
 [video]
 width = 640
 height = 480
 fps = 30
+
+[audio]
+sample_rate = 48000
+channels = 1
 ```
 
 ## Protocol
+
+### Kyber Key Exchange
+
+Before signaling begins, a post-quantum key exchange is performed:
+
+1. Client generates Kyber1024 key pair
+2. Client sends public key to server (`KeyExchangeInit`)
+3. Server encapsulates shared secret and returns ciphertext (`KeyExchangeResponse`)
+4. Client decapsulates to derive same shared secret
+5. Shared secret can be used for additional encryption layers
 
 ### Signaling Messages
 
@@ -175,6 +201,8 @@ The client and server communicate via JSON messages over TLS:
 
 | Message Type | Direction | Description |
 |--------------|-----------|-------------|
+| key_exchange_init | C→S | Send Kyber public key |
+| key_exchange_response | S→C | Return ciphertext |
 | login | C→S | User authentication |
 | list_rooms | C→S | Request room list |
 | create_room | C→S | Create a new room |
@@ -187,27 +215,32 @@ The client and server communicate via JSON messages over TLS:
 
 ## Implementation Status
 
-- ✅ Server skeleton with TLS listener
+- ✅ Rust server with TLS listener
+- ✅ Kyber1024 post-quantum key exchange
 - ✅ Basic room manager
 - ✅ DTLS-SRTP media forwarder stubs
-- ✅ Signaling client
+- ✅ Rust signaling client
 - ✅ Audio/video capture stubs
 - ✅ DTLS-SRTP media transport stubs
-- ✅ Python tkinter GUI
-- ✅ Configuration templates
+- ✅ egui native GUI
+- ✅ TOML configuration
 - ✅ Systemd service files
-- ✅ Installation scripts
+- ✅ Installation scripts for Raspberry Pi
 
 ## Future Enhancements
 
-- [ ] Implement actual post-quantum key exchange (Kyber)
+- [ ] Use Kyber shared secret for additional media encryption
 - [ ] Real DTLS-SRTP implementation
-- [ ] Actual audio/video capture with PyAudio and OpenCV
+- [ ] Actual audio/video capture integration
 - [ ] Audio/video encoding (Opus, VP8/VP9)
 - [ ] ICE/STUN/TURN support for NAT traversal
-- [ ] End-to-end encryption for media
+- [ ] End-to-end encryption for media using Kyber-derived keys
 - [ ] Screen sharing
 - [ ] Text chat
+
+## Security
+
+This project uses **Kyber1024**, a NIST-selected post-quantum key encapsulation mechanism that is resistant to attacks from both classical and quantum computers.
 
 ## License
 

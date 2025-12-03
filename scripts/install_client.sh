@@ -20,37 +20,49 @@ LOG_DIR="/var/log/pqc-chat"
 # Install dependencies
 echo "Installing dependencies..."
 apt-get update
-apt-get install -y python3 python3-pip python3-tk
+apt-get install -y openssl build-essential pkg-config libssl-dev
 
-# Optional: Install audio/video dependencies (uncomment if needed)
-# apt-get install -y python3-opencv python3-pyaudio
+# GUI dependencies for egui
+apt-get install -y libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+    libxkbcommon-dev libgtk-3-dev || echo "Note: Some GUI dependencies may be missing"
+
+# Install Rust if not present
+if ! command -v cargo &> /dev/null; then
+    echo "Installing Rust..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    source "$HOME/.cargo/env"
+fi
 
 # Create directories
 echo "Creating directories..."
-mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR/bin"
 mkdir -p "$CONFIG_DIR"
 mkdir -p "$LOG_DIR"
 
-# Copy application files
-echo "Installing application files..."
+# Build application
+echo "Building PQC Chat Client and GUI..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-cp -r "$PROJECT_DIR/server" "$INSTALL_DIR/"
-cp -r "$PROJECT_DIR/client" "$INSTALL_DIR/"
-cp -r "$PROJECT_DIR/gui" "$INSTALL_DIR/"
+cd "$PROJECT_DIR"
+cargo build --release --bin pqc-client
+cargo build --release --bin pqc-gui --features gui || echo "Note: GUI build may fail without display libraries"
+
+# Install binaries
+echo "Installing application..."
+cp "$PROJECT_DIR/target/release/pqc-client" "$INSTALL_DIR/bin/"
+cp "$PROJECT_DIR/target/release/pqc-gui" "$INSTALL_DIR/bin/" 2>/dev/null || true
 
 # Install configuration
 echo "Installing configuration..."
-if [ ! -f "$CONFIG_DIR/client.conf" ]; then
-    cp "$PROJECT_DIR/config/client.conf" "$CONFIG_DIR/"
+if [ ! -f "$CONFIG_DIR/client.toml" ]; then
+    cp "$PROJECT_DIR/config/client.toml" "$CONFIG_DIR/"
 fi
 
 # Set permissions
 echo "Setting permissions..."
 chown -R root:root "$INSTALL_DIR"
 chmod -R 755 "$INSTALL_DIR"
-mkdir -p "$LOG_DIR"
 chmod 755 "$LOG_DIR"
 
 # Install systemd service (template for per-user startup)
@@ -64,7 +76,7 @@ cat > /usr/share/applications/pqc-chat.desktop << 'EOF'
 [Desktop Entry]
 Name=PQC Chat
 Comment=Post-Quantum Secure Video Chat
-Exec=/usr/bin/python3 /opt/pqc-chat/gui/main_window.py
+Exec=/opt/pqc-chat/bin/pqc-gui
 Icon=video-display
 Terminal=false
 Type=Application
@@ -75,13 +87,16 @@ echo ""
 echo "=== Installation Complete ==="
 echo ""
 echo "To start the client GUI:"
-echo "  python3 /opt/pqc-chat/gui/main_window.py"
+echo "  /opt/pqc-chat/bin/pqc-gui"
+echo ""
+echo "To start the CLI client:"
+echo "  /opt/pqc-chat/bin/pqc-client"
 echo ""
 echo "Or use the desktop shortcut 'PQC Chat'"
 echo ""
 echo "To enable auto-start for user 'pi':"
 echo "  sudo systemctl enable pqc-chat-client@pi"
 echo ""
-echo "Configuration file: $CONFIG_DIR/client.conf"
+echo "Configuration file: $CONFIG_DIR/client.toml"
 echo ""
-echo "Note: Edit $CONFIG_DIR/client.conf to set the server address"
+echo "Note: Edit $CONFIG_DIR/client.toml to set the server address"
