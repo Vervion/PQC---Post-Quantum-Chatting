@@ -171,8 +171,9 @@ where
             }
 
             let msg_len = u32::from_be_bytes(len_buf) as usize;
-            if msg_len > 1024 * 1024 {
-                error!("Message too large from {}", peer_addr);
+            // Limit signaling messages to 64KB (reasonable for JSON)
+            if msg_len > 64 * 1024 {
+                error!("Message too large from {} ({} bytes)", peer_addr, msg_len);
                 break;
             }
 

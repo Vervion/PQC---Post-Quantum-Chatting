@@ -107,7 +107,9 @@ async fn main() -> Result<()> {
     // Create client engine
     let mut engine = ClientEngine::new(config, username.clone());
 
-    // Configure TLS (with certificate verification disabled for self-signed certs)
+    // Configure TLS
+    // WARNING: NoVerifier is used for development with self-signed certificates.
+    // For production, use proper certificate verification with CA certificates.
     let tls_config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoVerifier))
@@ -242,7 +244,10 @@ where
     Ok(SignalingMessage::from_bytes(&msg_buf)?)
 }
 
-/// Certificate verifier that accepts any certificate (for development)
+/// Certificate verifier that accepts any certificate.
+/// 
+/// WARNING: This is for DEVELOPMENT ONLY with self-signed certificates.
+/// In production, use proper certificate verification with CA certificates.
 #[derive(Debug)]
 struct NoVerifier;
 

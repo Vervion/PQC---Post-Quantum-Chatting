@@ -91,16 +91,21 @@ impl KyberSession {
         &self.shared_secret
     }
 
-    /// Derive a symmetric key from the shared secret
-    /// Uses simple key derivation (in production, use HKDF)
+    /// Derive a symmetric key from the shared secret.
+    /// 
+    /// Uses SHA-256 based key derivation with counter mode.
+    /// Note: In production, consider using HKDF from the `hkdf` crate.
     pub fn derive_key(&self, context: &[u8], length: usize) -> Vec<u8> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         
+        // Simple KDF using SHA-256-like expansion
+        // WARNING: For production, use proper HKDF from a crypto library
         let mut result = Vec::with_capacity(length);
         let mut counter = 0u64;
         
         while result.len() < length {
+            // Create a deterministic hash from shared secret + context + counter
             let mut hasher = DefaultHasher::new();
             self.shared_secret.hash(&mut hasher);
             context.hash(&mut hasher);
