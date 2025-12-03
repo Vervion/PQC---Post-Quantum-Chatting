@@ -1,0 +1,36 @@
+[Unit]
+Description=PQC Chat Server - Post-Quantum Secure Chat
+Documentation=https://github.com/your-org/pqc-chat
+After=network.target
+
+[Service]
+Type=simple
+User=pqc-chat
+Group=pqc-chat
+WorkingDirectory=/opt/pqc-chat
+
+# Main server process
+ExecStart=/usr/bin/python3 /opt/pqc-chat/run_server.py --config /etc/pqc-chat/server.conf
+
+# Restart configuration
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log/pqc-chat
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pqc-chat-server
+
+[Install]
+WantedBy=multi-user.target
