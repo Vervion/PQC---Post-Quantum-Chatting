@@ -225,6 +225,11 @@ impl EnhancedPqcChatApp {
                     }).collect();
                 },
                 GuiUpdate::RoomJoined { room, participants } => {
+                    eprintln!("DEBUG: RoomJoined - received {} participants", participants.len());
+                    for (i, p) in participants.iter().enumerate() {
+                        eprintln!("DEBUG: Participant {}: {} ({})", i, p.username, p.id);
+                    }
+                    
                     self.current_room = Some(RoomData {
                         id: room.id.clone(),
                         name: room.name.clone(),
@@ -233,7 +238,7 @@ impl EnhancedPqcChatApp {
                         is_locked: room.is_locked,
                     });
                     self.room_participants = participants;
-                    self.add_status_message(format!("🎉 Joined room: {}", room.name));
+                    self.add_status_message(format!("🎉 Joined room: {} with {} participants", room.name, self.room_participants.len()));
                 },
                 GuiUpdate::RoomLeft => {
                     if let Some(room) = &self.current_room {
@@ -243,6 +248,7 @@ impl EnhancedPqcChatApp {
                     self.room_participants.clear();
                 },
                 GuiUpdate::ParticipantJoined { participant } => {
+                    eprintln!("DEBUG: ParticipantJoined - {} ({})", participant.username, participant.id);
                     self.room_participants.push(participant.clone());
                     self.connected_users.insert(participant.id.clone(), ConnectedUser {
                         id: participant.id.clone(),
@@ -252,7 +258,7 @@ impl EnhancedPqcChatApp {
                         audio_enabled: participant.audio_enabled,
                         video_enabled: participant.video_enabled,
                     });
-                    self.add_status_message(format!("🟢 {} joined the room", participant.username));
+                    self.add_status_message(format!("🟢 {} joined the room (total: {})", participant.username, self.room_participants.len()));
                 },
                 GuiUpdate::ParticipantLeft { participant_id } => {
                     self.room_participants.retain(|p| p.id != participant_id);
@@ -365,9 +371,12 @@ impl eframe::App for EnhancedPqcChatApp {
                         ui.group(|ui| {
                             ui.label("📍 Current Room:");
                             ui.strong(&room.name);
-                            ui.label(format!("👥 {} / {} participants", room.participants, room.max_participants));
+                            ui.label(format!("👥 {} / {} participants (GUI sees: {})", room.participants, room.max_participants, self.room_participants.len()));
                             if ui.button("👋 Leave Room").clicked() {
                                 self.send_command(GuiCommand::LeaveRoom);
+                            }
+                            if ui.button("🔄 Debug Refresh").clicked() {
+                                self.send_command(GuiCommand::ListRooms);
                             }
                         });
                         ui.separator();
