@@ -250,21 +250,16 @@ impl EnhancedPqcChatApp {
                 GuiUpdate::ParticipantJoined { participant } => {
                     eprintln!("DEBUG: ParticipantJoined - {} ({})", participant.username, participant.id);
                     self.room_participants.push(participant.clone());
-                    self.connected_users.insert(participant.id.clone(), ConnectedUser {
-                        id: participant.id.clone(),
-                        username: participant.username.clone(),
-                        connected_at: std::time::SystemTime::now(),
-                        in_room: self.current_room.as_ref().map(|r| r.id.clone()),
-                        audio_enabled: participant.audio_enabled,
-                        video_enabled: participant.video_enabled,
-                    });
                     self.add_status_message(format!("🟢 {} joined the room (total: {})", participant.username, self.room_participants.len()));
                 },
                 GuiUpdate::ParticipantLeft { participant_id } => {
                     self.room_participants.retain(|p| p.id != participant_id);
-                    if let Some(user) = self.connected_users.remove(&participant_id) {
-                        self.add_status_message(format!("🔴 {} left the room", user.username));
-                    }
+                    // Find the username for the status message
+                    let username = self.room_participants.iter()
+                        .find(|p| p.id == participant_id)
+                        .map(|p| p.username.clone())
+                        .unwrap_or_else(|| "User".to_string());
+                    self.add_status_message(format!("🔴 {} left the room", username));
                 },
                 GuiUpdate::ParticipantAudioToggled { participant_id, enabled } => {
                     if let Some(participant) = self.room_participants.iter_mut().find(|p| p.id == participant_id) {
@@ -445,37 +440,39 @@ impl eframe::App for EnhancedPqcChatApp {
                 .resizable(true)
                 .default_width(250.0)
                 .show(ctx, |ui| {
-                    ui.heading("👥 Connected Users");
+                    ui.heading("👥 Connected Users (Server-wide)");
                     ui.separator();
                     
-                    ui.label(format!("Total: {} users", self.connected_users.len()));
+                    ui.label("All users connected to the server:");
+                    ui.label(format!("Currently showing: {} users", self.connected_users.len()));
                     ui.separator();
                     
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
-                            for user in self.connected_users.values() {
-                                ui.group(|ui| {
-                                    ui.horizontal(|ui| {
-                                        // Status indicators
-                                        let audio_icon = if user.audio_enabled { "🎤" } else { "🔇" };
-                                        let video_icon = if user.video_enabled { "📹" } else { "📺" };
-                                        
-                                        ui.label(format!("{} {}", audio_icon, video_icon));
-                                        ui.strong(&user.username);
-                                    });
+                            // Show current user (we know we're connected)
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    let audio_icon = if self.audio_enabled { "🎤" } else { "🔇" };
+                                    let video_icon = if self.video_enabled { "📹" } else { "📺" };
                                     
-                                    if let Some(room) = &user.in_room {
-                                        ui.label(format!("🏠 In room: {}", room));
-                                    }
-                                    
-                                    // Connection time
-                                    if let Ok(duration) = user.connected_at.elapsed() {
-                                        ui.label(format!("⏱️ {}s", duration.as_secs()));
-                                    }
+                                    ui.label(format!("{} {}", audio_icon, video_icon));
+                                    ui.strong(&self.username);
+                                    ui.label("(You)");
                                 });
-                                ui.separator();
-                            }
+                                
+                                if let Some(room) = &self.current_room {
+                                    ui.label(format!("🏠 In room: {}", room.name));
+                                } else {
+                                    ui.label("🏠 In lobby");
+                                }
+                                
+                                ui.label("⏱️ Online");
+                            });
+                            
+                            ui.separator();
+                            ui.label("📝 Note: Server-wide user tracking needs implementation");
+                            ui.label("Currently showing only current user as example");
                         });
                 });
         }
