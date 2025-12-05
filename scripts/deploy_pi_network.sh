@@ -71,6 +71,11 @@ setup_server() {
     echo "  - Signaling: https://192.168.10.101:8443"
     echo "  - Audio: udp://192.168.10.101:10000"
     echo "  - Video: udp://192.168.10.101:10001"
+    echo ""
+    echo "To also run a client on this server Pi:"
+    echo "  - Copy client config: sudo cp config/server_client_pi.toml /etc/pqc-chat/client.toml"
+    echo "  - Run GUI client: ./target/release/pqc-gui"
+    echo "  - Or install client: sudo ./scripts/install_client.sh"
 }
 
 # Function to setup client
@@ -171,11 +176,41 @@ main() {
     echo "  Internet access: $(ping -c1 google.com &>/dev/null && echo "Available" || echo "Not available")"
 }
 
+# Function to setup server + client
+setup_server_client() {
+    echo "Setting up this Pi as both PQC Chat Server AND Client"
+    
+    # First set up as server
+    setup_server
+    
+    echo ""
+    echo "=== Adding Client Capability ==="
+    
+    # Install client configuration for localhost connection
+    sudo cp config/server_client_pi.toml /etc/pqc-chat/client.toml
+    
+    # Install client components
+    if [ -x "./scripts/install_client.sh" ]; then
+        sudo ./scripts/install_client.sh
+    else
+        echo "Warning: install_client.sh not found, client GUI may not be installed"
+    fi
+    
+    echo ""
+    echo "=== Server + Client Setup Complete ==="
+    echo "Server is running as a service"
+    echo "To join the chat as a client, run: /opt/pqc-chat/bin/pqc-gui"
+    echo "The client will connect to the local server (127.0.0.1)"
+}
+
 # Handle manual role specification
 if [ $# -eq 1 ]; then
     case $1 in
         "server")
             setup_server
+            ;;
+        "server-client"|"server_client")
+            setup_server_client
             ;;
         "client1")
             setup_client 1
@@ -184,7 +219,11 @@ if [ $# -eq 1 ]; then
             setup_client 2
             ;;
         *)
-            echo "Usage: $0 [server|client1|client2]"
+            echo "Usage: $0 [server|server-client|client1|client2]"
+            echo "  server       - Server only"
+            echo "  server-client- Server + client capability"
+            echo "  client1      - Client 1 (192.168.10.102)"
+            echo "  client2      - Client 2 (192.168.10.103)"
             echo "If no argument is provided, role will be auto-detected based on IP address."
             exit 1
             ;;
