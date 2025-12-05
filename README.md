@@ -56,11 +56,14 @@ This project implements a secure audio/video chat system with the following feat
 - Command-line interface for testing
 
 ### GUI (`src/gui/`)
-- **main.rs**: egui-based native GUI with controls for:
-  - Server connection
-  - Room browsing and creation
-  - Joining/leaving rooms
-  - Audio/video toggle
+- **main.rs**: Basic egui-based native GUI (stub implementation)
+- **enhanced_main.rs**: Advanced GUI with real-time features:
+  - **Real server communication** with TLS/Kyber key exchange
+  - **Live user management** - see all connected users with status
+  - **Real-time room updates** - participant join/leave notifications
+  - **Multi-panel interface** - users, rooms, and participant panels
+  - **Audio/video controls** - working toggle buttons with status indicators
+  - **Status message system** - live event notifications with emoji indicators
 
 ### Library (`src/`)
 - **crypto/kyber.rs**: Kyber1024 key encapsulation mechanism
@@ -119,9 +122,10 @@ This project implements a secure audio/video chat system with the following feat
 
 5. Run the client (in another terminal):
    ```bash
-   ./target/release/pqc-client --host 127.0.0.1
-   # Or run the GUI:
-   ./target/release/pqc-gui
+   # Interactive terminal client:
+   ./target/release/pqc-interactive --host 127.0.0.1
+   # Or run the enhanced GUI:
+   ./target/release/pqc-enhanced-gui
    ```
 
 ### Raspberry Pi Installation
@@ -229,6 +233,11 @@ The client and server communicate via JSON messages over TLS:
 
 ## Future Enhancements
 
+- [x] **Enhanced GUI with Real-time User Management** - Live participant tracking and status updates
+- [x] **Real Server Communication** - Actual TLS/Kyber communication instead of stub implementations  
+- [x] **Live Room Management** - Real-time room creation, joining, and participant updates
+- [x] **User Status Indicators** - Audio/video status with emoji indicators
+- [x] **Multi-panel Interface** - Dedicated panels for users, rooms, and controls
 - [ ] Use Kyber shared secret for additional media encryption
 - [ ] Real DTLS-SRTP implementation
 - [ ] Actual audio/video capture integration

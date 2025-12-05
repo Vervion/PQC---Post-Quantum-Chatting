@@ -45,13 +45,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
-cargo build --release --bin pqc-client
-cargo build --release --bin pqc-gui --features gui || echo "Note: GUI build may fail without display libraries"
+cargo build --release --bin pqc-interactive
+cargo build --release --bin pqc-enhanced-gui --features gui || echo "Note: Enhanced GUI build may fail without display libraries"
 
 # Install binaries
 echo "Installing application..."
-cp "$PROJECT_DIR/target/release/pqc-client" "$INSTALL_DIR/bin/"
-cp "$PROJECT_DIR/target/release/pqc-gui" "$INSTALL_DIR/bin/" 2>/dev/null || true
+cp "$PROJECT_DIR/target/release/pqc-interactive" "$INSTALL_DIR/bin/"
+cp "$PROJECT_DIR/target/release/pqc-enhanced-gui" "$INSTALL_DIR/bin/" 2>/dev/null || true
 
 # Install configuration
 echo "Installing configuration..."
@@ -76,7 +76,7 @@ cat > /usr/share/applications/pqc-chat.desktop << 'EOF'
 [Desktop Entry]
 Name=PQC Chat
 Comment=Post-Quantum Secure Video Chat
-Exec=/opt/pqc-chat/bin/pqc-gui
+Exec=/opt/pqc-chat/bin/pqc-enhanced-gui
 Icon=video-display
 Terminal=false
 Type=Application
@@ -87,10 +87,10 @@ echo ""
 echo "=== Installation Complete ==="
 echo ""
 echo "To start the client GUI:"
-echo "  /opt/pqc-chat/bin/pqc-gui"
+echo "  /opt/pqc-chat/bin/pqc-enhanced-gui"
 echo ""
 echo "To start the CLI client:"
-echo "  /opt/pqc-chat/bin/pqc-client"
+echo "  /opt/pqc-chat/bin/pqc-interactive"
 echo ""
 echo "Or use the desktop shortcut 'PQC Chat'"
 echo ""

@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_rustls::rustls::{self, pki_types::PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
@@ -45,21 +46,20 @@ struct Args {
 }
 
 /// Client connection state
-#[allow(dead_code)]
 struct ClientState {
     participant_id: String,
     username: Option<String>,
-    kyber: KyberKeyExchange,
     shared_secret: Option<Vec<u8>>,
+    message_tx: mpsc::UnboundedSender<SignalingMessage>,
 }
 
 impl ClientState {
-    fn new() -> Self {
+    fn new(message_tx: mpsc::UnboundedSender<SignalingMessage>) -> Self {
         Self {
             participant_id: Uuid::new_v4().to_string(),
             username: None,
-            kyber: KyberKeyExchange::new(),
             shared_secret: None,
+            message_tx,
         }
     }
 }
@@ -146,14 +146,17 @@ async fn main() -> Result<()> {
 
 /// Handle a connected client
 async fn handle_client<S>(
-    mut stream: tokio_rustls::server::TlsStream<S>,
+    stream: tokio_rustls::server::TlsStream<S>,
     peer_addr: SocketAddr,
     state: Arc<ServerState>,
 ) -> Result<()>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let client_state = Arc::new(RwLock::new(ClientState::new()));
+    // Create message channel for broadcasting to this client
+    let (message_tx, mut message_rx) = mpsc::unbounded_channel();
+    
+    let client_state = Arc::new(RwLock::new(ClientState::new(message_tx)));
     let participant_id = client_state.read().participant_id.clone();
 
     // Register client
@@ -162,11 +165,28 @@ where
         .write()
         .insert(participant_id.clone(), client_state.clone());
 
+    // Split stream for concurrent reading and writing
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    
+    // Spawn task to handle outgoing messages (broadcasts from server)
+    let broadcast_task = tokio::spawn(async move {
+        while let Some(message) = message_rx.recv().await {
+            if let Ok(data) = message.to_framed() {
+                if write_half.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Handle incoming messages
+    let mut read_stream = read_half;
+
     let result = async {
         loop {
             // Read message length (4 bytes)
             let mut len_buf = [0u8; 4];
-            if stream.read_exact(&mut len_buf).await.is_err() {
+            if read_stream.read_exact(&mut len_buf).await.is_err() {
                 break;
             }
 
@@ -179,7 +199,7 @@ where
 
             // Read message
             let mut msg_buf = vec![0u8; msg_len];
-            if stream.read_exact(&mut msg_buf).await.is_err() {
+            if read_stream.read_exact(&mut msg_buf).await.is_err() {
                 break;
             }
 
@@ -189,17 +209,19 @@ where
                     let response =
                         handle_message(message, &participant_id, &client_state, &state).await;
                     
-                    // Send response
-                    let response_data = response.to_framed()?;
-                    stream.write_all(&response_data).await?;
+                    // Send response through the client's message channel
+                    if let Some(client) = state.clients.read().get(&participant_id) {
+                        let _ = client.read().message_tx.send(response);
+                    }
                 }
                 Err(e) => {
                     error!("Invalid message from {}: {}", peer_addr, e);
                     let error_msg = SignalingMessage::Error {
                         message: "Invalid message format".to_string(),
                     };
-                    let data = error_msg.to_framed()?;
-                    stream.write_all(&data).await?;
+                    if let Some(client) = state.clients.read().get(&participant_id) {
+                        let _ = client.read().message_tx.send(error_msg);
+                    }
                 }
             }
         }
@@ -209,7 +231,17 @@ where
 
     // Cleanup
     state.clients.write().remove(&participant_id);
+    
+    // Notify other room participants that this user left
+    if let Some(room) = state.room_manager.get_participant_room(&participant_id) {
+        let _username = client_state.read().username.clone().unwrap_or_default();
+        broadcast_to_room(&state, &room.id, &participant_id, SignalingMessage::ParticipantLeft {
+            participant_id: participant_id.clone(),
+        }).await;
+    }
+    
     let _ = state.room_manager.leave_room(&participant_id);
+    broadcast_task.abort();
     info!("Client {} disconnected", peer_addr);
 
     result
@@ -280,10 +312,16 @@ async fn handle_message(
         }
 
         SignalingMessage::JoinRoom { room_id, username } => {
-            let participant = Participant::new(participant_id.to_string(), username);
+            let participant = Participant::new(participant_id.to_string(), username.clone());
 
             match state.room_manager.join_room(&room_id, participant) {
                 Ok(room) => {
+                    // Broadcast to other participants that someone joined
+                    broadcast_to_room(&state, &room_id, participant_id, SignalingMessage::ParticipantJoined {
+                        participant_id: participant_id.to_string(),
+                        username: username.clone(),
+                    }).await;
+
                     let participants: Vec<ParticipantInfo> = room
                         .get_participants()
                         .iter()
@@ -313,15 +351,29 @@ async fn handle_message(
             }
         }
 
-        SignalingMessage::LeaveRoom => match state.room_manager.leave_room(participant_id) {
-            Ok(()) => SignalingMessage::RoomLeft {
-                success: true,
-                error: None,
-            },
-            Err(e) => SignalingMessage::RoomLeft {
-                success: false,
-                error: Some(e.to_string()),
-            },
+        SignalingMessage::LeaveRoom => {
+            // Get room info before leaving
+            let room_info = state.room_manager.get_participant_room(participant_id);
+            
+            match state.room_manager.leave_room(participant_id) {
+                Ok(()) => {
+                    // Broadcast to other participants that someone left
+                    if let Some(room) = room_info {
+                        broadcast_to_room(&state, &room.id, participant_id, SignalingMessage::ParticipantLeft {
+                            participant_id: participant_id.to_string(),
+                        }).await;
+                    }
+                    
+                    SignalingMessage::RoomLeft {
+                        success: true,
+                        error: None,
+                    }
+                },
+                Err(e) => SignalingMessage::RoomLeft {
+                    success: false,
+                    error: Some(e.to_string()),
+                },
+            }
         },
 
         SignalingMessage::ToggleAudio { enabled } => {
@@ -364,4 +416,36 @@ fn load_key(path: &PathBuf) -> Result<PrivateKeyDer<'static>> {
     let mut reader = std::io::BufReader::new(file);
     let keys = rustls_pemfile::private_key(&mut reader)?;
     keys.ok_or_else(|| anyhow::anyhow!("No private key found"))
+}
+
+/// Broadcast a message to all participants in a room except the sender
+async fn broadcast_to_room(
+    state: &Arc<ServerState>, 
+    room_id: &str, 
+    sender_id: &str, 
+    message: SignalingMessage
+) {
+    if let Some(room) = state.room_manager.get_room(room_id) {
+        let participant_ids = room.get_participant_ids();
+        let clients = state.clients.read();
+        
+        info!("Broadcasting {:?} to room {} (except sender {})", message, room_id, sender_id);
+        info!("Participants in room: {:?}", participant_ids);
+        
+        for participant_id in participant_ids {
+            // Don't send to the sender
+            if participant_id != sender_id {
+                if let Some(client_state) = clients.get(&participant_id) {
+                    info!("Sending broadcast to participant {}", participant_id);
+                    if let Err(e) = client_state.read().message_tx.send(message.clone()) {
+                        error!("Failed to send broadcast to {}: {}", participant_id, e);
+                    }
+                } else {
+                    info!("Client {} not found in clients map", participant_id);
+                }
+            }
+        }
+    } else {
+        info!("Room {} not found for broadcast", room_id);
+    }
 }

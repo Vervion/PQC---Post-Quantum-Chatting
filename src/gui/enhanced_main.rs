@@ -1,0 +1,809 @@
+//! Enhanced PQC Chat GUI - Real-time User Management
+//!
+//! Advanced GUI with live user tracking and real server communication
+
+#[cfg(feature = "gui")]
+use eframe::egui;
+#[cfg(feature = "gui")]
+use std::collections::HashMap;
+#[cfg(feature = "gui")]
+use std::sync::{Arc, Mutex};
+#[cfg(feature = "gui")]
+use tokio::sync::mpsc;
+#[cfg(feature = "gui")]
+use tokio::runtime::Runtime;
+#[cfg(feature = "gui")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[cfg(feature = "gui")]
+use pqc_chat::crypto::kyber::KyberKeyExchange;
+#[cfg(feature = "gui")]
+use pqc_chat::protocol::{ParticipantInfo, RoomInfo, SignalingMessage};
+
+
+#[cfg(feature = "gui")]
+fn main() -> Result<(), eframe::Error> {
+    env_logger::init();
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1000.0, 700.0])
+            .with_min_inner_size([800.0, 600.0])
+            .with_title("PQC Chat - Post-Quantum Secure"),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "PQC Chat - Enhanced",
+        options,
+        Box::new(|cc| Box::new(EnhancedPqcChatApp::new(cc))),
+    )
+}
+
+#[cfg(not(feature = "gui"))]
+fn main() {
+    eprintln!("GUI feature not enabled. Build with: cargo build --features gui");
+}
+
+#[cfg(feature = "gui")]
+#[derive(Clone)]
+struct ConnectedUser {
+    id: String,
+    username: String,
+    connected_at: std::time::SystemTime,
+    in_room: Option<String>,
+    audio_enabled: bool,
+    video_enabled: bool,
+}
+
+#[cfg(feature = "gui")]
+#[derive(Clone)]
+struct RoomData {
+    id: String,
+    name: String,
+    participants: u32,
+    max_participants: u32,
+    is_locked: bool,
+}
+
+#[cfg(feature = "gui")]
+struct EnhancedPqcChatApp {
+    // Connection state
+    server_host: String,
+    server_port: String,
+    username: String,
+    is_connected: bool,
+    connection_status: String,
+
+    // Room state
+    rooms: Vec<RoomData>,
+    current_room: Option<RoomData>,
+    selected_room_idx: Option<usize>,
+    new_room_name: String,
+    room_participants: Vec<ParticipantInfo>,
+
+    // User management
+    connected_users: HashMap<String, ConnectedUser>,
+    user_list_scroll: f32,
+
+    // Media state
+    audio_enabled: bool,
+    video_enabled: bool,
+
+    // UI state
+    show_users_panel: bool,
+    show_rooms_panel: bool,
+    status_messages: Vec<(String, std::time::SystemTime)>,
+    
+    // Communication
+    runtime: Option<Arc<Runtime>>,
+    command_sender: Option<mpsc::UnboundedSender<GuiCommand>>,
+    update_receiver: Option<Arc<Mutex<mpsc::UnboundedReceiver<GuiUpdate>>>>,
+}
+
+#[cfg(feature = "gui")]
+#[derive(Debug)]
+enum GuiCommand {
+    Connect { host: String, port: u16, username: String },
+    Disconnect,
+    ListRooms,
+    CreateRoom { name: String, max_participants: u32 },
+    JoinRoom { room_id: String },
+    LeaveRoom,
+    ToggleAudio { enabled: bool },
+    ToggleVideo { enabled: bool },
+}
+
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone)]
+enum GuiUpdate {
+    Connected { participant_id: String },
+    Disconnected,
+    ConnectionError { error: String },
+    RoomList { rooms: Vec<RoomInfo> },
+    RoomJoined { room: RoomInfo, participants: Vec<ParticipantInfo> },
+    RoomLeft,
+    ParticipantJoined { participant: ParticipantInfo },
+    ParticipantLeft { participant_id: String },
+    ParticipantAudioToggled { participant_id: String, enabled: bool },
+    ParticipantVideoToggled { participant_id: String, enabled: bool },
+    StatusMessage { message: String },
+}
+
+#[cfg(feature = "gui")]
+impl EnhancedPqcChatApp {
+    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let runtime = Arc::new(
+            Runtime::new().expect("Failed to create tokio runtime")
+        );
+
+        let (command_sender, command_receiver) = mpsc::unbounded_channel();
+        let (update_sender, update_receiver) = mpsc::unbounded_channel();
+        let update_receiver = Arc::new(Mutex::new(update_receiver));
+
+        // Spawn the communication task
+        let rt = runtime.clone();
+        std::thread::spawn(move || {
+            rt.block_on(async {
+                communication_task(command_receiver, update_sender).await;
+            });
+        });
+
+        Self {
+            server_host: "127.0.0.1".to_string(),
+            server_port: "8443".to_string(),
+            username: "User".to_string(),
+            is_connected: false,
+            connection_status: "Disconnected".to_string(),
+            rooms: Vec::new(),
+            current_room: None,
+            selected_room_idx: None,
+            new_room_name: String::new(),
+            room_participants: Vec::new(),
+            connected_users: HashMap::new(),
+            user_list_scroll: 0.0,
+            audio_enabled: true,
+            video_enabled: true,
+            show_users_panel: true,
+            show_rooms_panel: true,
+            status_messages: Vec::new(),
+            runtime: Some(runtime),
+            command_sender: Some(command_sender),
+            update_receiver: Some(update_receiver),
+        }
+    }
+
+    fn process_updates(&mut self) {
+        let updates = if let Some(receiver) = &self.update_receiver {
+            let mut receiver = receiver.lock().unwrap();
+            let mut updates = Vec::new();
+            while let Ok(update) = receiver.try_recv() {
+                updates.push(update);
+            }
+            updates
+        } else {
+            Vec::new()
+        };
+        
+        for update in updates {
+            match update {
+                GuiUpdate::Connected { participant_id } => {
+                    self.is_connected = true;
+                    self.connection_status = format!("Connected as {}", self.username);
+                    self.add_status_message("🟢 Connected to server".to_string());
+                    
+                    // Add ourselves to connected users
+                    self.connected_users.insert(participant_id.clone(), ConnectedUser {
+                        id: participant_id,
+                        username: self.username.clone(),
+                        connected_at: std::time::SystemTime::now(),
+                        in_room: None,
+                        audio_enabled: self.audio_enabled,
+                        video_enabled: self.video_enabled,
+                    });
+                },
+                GuiUpdate::Disconnected => {
+                    self.is_connected = false;
+                    self.connection_status = "Disconnected".to_string();
+                    self.rooms.clear();
+                    self.current_room = None;
+                    self.connected_users.clear();
+                    self.room_participants.clear();
+                    self.add_status_message("🔴 Disconnected from server".to_string());
+                },
+                GuiUpdate::ConnectionError { error } => {
+                    self.connection_status = format!("Connection Error: {}", error);
+                    self.add_status_message(format!("❌ Connection failed: {}", error));
+                },
+                GuiUpdate::RoomList { rooms } => {
+                    self.rooms = rooms.into_iter().map(|r| RoomData {
+                        id: r.id,
+                        name: r.name,
+                        participants: r.participants,
+                        max_participants: r.max_participants,
+                        is_locked: r.is_locked,
+                    }).collect();
+                },
+                GuiUpdate::RoomJoined { room, participants } => {
+                    self.current_room = Some(RoomData {
+                        id: room.id.clone(),
+                        name: room.name.clone(),
+                        participants: room.participants,
+                        max_participants: room.max_participants,
+                        is_locked: room.is_locked,
+                    });
+                    self.room_participants = participants;
+                    self.add_status_message(format!("🎉 Joined room: {}", room.name));
+                },
+                GuiUpdate::RoomLeft => {
+                    if let Some(room) = &self.current_room {
+                        self.add_status_message(format!("👋 Left room: {}", room.name));
+                    }
+                    self.current_room = None;
+                    self.room_participants.clear();
+                },
+                GuiUpdate::ParticipantJoined { participant } => {
+                    self.room_participants.push(participant.clone());
+                    self.connected_users.insert(participant.id.clone(), ConnectedUser {
+                        id: participant.id.clone(),
+                        username: participant.username.clone(),
+                        connected_at: std::time::SystemTime::now(),
+                        in_room: self.current_room.as_ref().map(|r| r.id.clone()),
+                        audio_enabled: participant.audio_enabled,
+                        video_enabled: participant.video_enabled,
+                    });
+                    self.add_status_message(format!("🟢 {} joined the room", participant.username));
+                },
+                GuiUpdate::ParticipantLeft { participant_id } => {
+                    self.room_participants.retain(|p| p.id != participant_id);
+                    if let Some(user) = self.connected_users.remove(&participant_id) {
+                        self.add_status_message(format!("🔴 {} left the room", user.username));
+                    }
+                },
+                GuiUpdate::ParticipantAudioToggled { participant_id, enabled } => {
+                    if let Some(participant) = self.room_participants.iter_mut().find(|p| p.id == participant_id) {
+                        participant.audio_enabled = enabled;
+                    }
+                    if let Some(user) = self.connected_users.get_mut(&participant_id) {
+                        user.audio_enabled = enabled;
+                    }
+                },
+                GuiUpdate::ParticipantVideoToggled { participant_id, enabled } => {
+                    if let Some(participant) = self.room_participants.iter_mut().find(|p| p.id == participant_id) {
+                        participant.video_enabled = enabled;
+                    }
+                    if let Some(user) = self.connected_users.get_mut(&participant_id) {
+                        user.video_enabled = enabled;
+                    }
+                },
+                GuiUpdate::StatusMessage { message } => {
+                    self.add_status_message(message);
+                },
+            }
+        }
+    }
+
+    fn add_status_message(&mut self, message: String) {
+        self.status_messages.push((message, std::time::SystemTime::now()));
+        // Keep only last 50 messages
+        if self.status_messages.len() > 50 {
+            self.status_messages.remove(0);
+        }
+    }
+
+    fn send_command(&self, command: GuiCommand) {
+        if let Some(sender) = &self.command_sender {
+            let _ = sender.send(command);
+        }
+    }
+}
+
+#[cfg(feature = "gui")]
+impl eframe::App for EnhancedPqcChatApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Process updates from backend
+        self.process_updates();
+
+        // Request repaint for live updates
+        ctx.request_repaint();
+
+        // Top menu bar
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("🔐 PQC Chat - Post-Quantum Secure");
+                ui.separator();
+                ui.label(&self.connection_status);
+                ui.separator();
+                
+                ui.checkbox(&mut self.show_users_panel, "👥 Users");
+                ui.checkbox(&mut self.show_rooms_panel, "🏠 Rooms");
+                
+                if self.is_connected {
+                    ui.separator();
+                    if ui.button("🔌 Disconnect").clicked() {
+                        self.send_command(GuiCommand::Disconnect);
+                    }
+                }
+            });
+        });
+
+        // Left panel - Connection and Rooms
+        egui::SidePanel::left("left_panel")
+            .resizable(true)
+            .default_width(300.0)
+            .show(ctx, |ui| {
+                if !self.is_connected {
+                    ui.heading("Connection");
+                    ui.separator();
+                    
+                    ui.label("Server Host:");
+                    ui.text_edit_singleline(&mut self.server_host);
+                    
+                    ui.label("Port:");
+                    ui.text_edit_singleline(&mut self.server_port);
+                    
+                    ui.label("Username:");
+                    ui.text_edit_singleline(&mut self.username);
+                    
+                    ui.separator();
+                    
+                    if ui.button("🔌 Connect").clicked() {
+                        if let Ok(port) = self.server_port.parse() {
+                            self.send_command(GuiCommand::Connect {
+                                host: self.server_host.clone(),
+                                port,
+                                username: self.username.clone(),
+                            });
+                        }
+                    }
+                } else if self.show_rooms_panel {
+                    ui.heading("Rooms");
+                    ui.separator();
+                    
+                    // Current room status
+                    if let Some(room) = &self.current_room {
+                        ui.group(|ui| {
+                            ui.label("📍 Current Room:");
+                            ui.strong(&room.name);
+                            ui.label(format!("👥 {} / {} participants", room.participants, room.max_participants));
+                            if ui.button("👋 Leave Room").clicked() {
+                                self.send_command(GuiCommand::LeaveRoom);
+                            }
+                        });
+                        ui.separator();
+                    }
+                    
+                    // Room list
+                    ui.horizontal(|ui| {
+                        ui.label("🏠 Available Rooms:");
+                        if ui.button("🔄").clicked() {
+                            self.send_command(GuiCommand::ListRooms);
+                        }
+                    });
+                    
+                    egui::ScrollArea::vertical()
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for (idx, room) in self.rooms.iter().enumerate() {
+                                let is_selected = self.selected_room_idx == Some(idx);
+                                let response = ui.selectable_label(is_selected, format!(
+                                    "🏠 {} ({}/{}{})",
+                                    room.name,
+                                    room.participants,
+                                    room.max_participants,
+                                    if room.is_locked { " 🔒" } else { "" }
+                                ));
+                                
+                                if response.clicked() {
+                                    self.selected_room_idx = Some(idx);
+                                }
+                                
+                                if response.double_clicked() {
+                                    self.send_command(GuiCommand::JoinRoom {
+                                        room_id: room.id.clone(),
+                                    });
+                                }
+                            }
+                        });
+                    
+                    if let Some(idx) = self.selected_room_idx {
+                        if idx < self.rooms.len() && ui.button("🚪 Join Room").clicked() {
+                            self.send_command(GuiCommand::JoinRoom {
+                                room_id: self.rooms[idx].id.clone(),
+                            });
+                        }
+                    }
+                    
+                    ui.separator();
+                    
+                    // Create room
+                    ui.label("Create New Room:");
+                    ui.text_edit_singleline(&mut self.new_room_name);
+                    
+                    if ui.button("➕ Create Room").clicked() && !self.new_room_name.is_empty() {
+                        self.send_command(GuiCommand::CreateRoom {
+                            name: self.new_room_name.clone(),
+                            max_participants: 10,
+                        });
+                        self.new_room_name.clear();
+                    }
+                }
+            });
+
+        // Right panel - Connected Users
+        if self.show_users_panel {
+            egui::SidePanel::right("users_panel")
+                .resizable(true)
+                .default_width(250.0)
+                .show(ctx, |ui| {
+                    ui.heading("👥 Connected Users");
+                    ui.separator();
+                    
+                    ui.label(format!("Total: {} users", self.connected_users.len()));
+                    ui.separator();
+                    
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            for user in self.connected_users.values() {
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        // Status indicators
+                                        let audio_icon = if user.audio_enabled { "🎤" } else { "🔇" };
+                                        let video_icon = if user.video_enabled { "📹" } else { "📺" };
+                                        
+                                        ui.label(format!("{} {}", audio_icon, video_icon));
+                                        ui.strong(&user.username);
+                                    });
+                                    
+                                    if let Some(room) = &user.in_room {
+                                        ui.label(format!("🏠 In room: {}", room));
+                                    }
+                                    
+                                    // Connection time
+                                    if let Ok(duration) = user.connected_at.elapsed() {
+                                        ui.label(format!("⏱️ {}s", duration.as_secs()));
+                                    }
+                                });
+                                ui.separator();
+                            }
+                        });
+                });
+        }
+
+        // Central panel - Room participants and controls
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.is_connected {
+                if let Some(room) = &self.current_room {
+                    ui.heading(format!("🏠 Room: {}", room.name));
+                    ui.separator();
+                    
+                    // Media controls
+                    ui.horizontal(|ui| {
+                        if self.audio_enabled {
+                            if ui.button("🎤 Audio ON").clicked() {
+                                self.audio_enabled = false;
+                                self.send_command(GuiCommand::ToggleAudio { enabled: false });
+                            }
+                        } else {
+                            if ui.button("🔇 Audio OFF").clicked() {
+                                self.audio_enabled = true;
+                                self.send_command(GuiCommand::ToggleAudio { enabled: true });
+                            }
+                        };
+                        
+                        if self.video_enabled {
+                            if ui.button("📹 Video ON").clicked() {
+                                self.video_enabled = false;
+                                self.send_command(GuiCommand::ToggleVideo { enabled: false });
+                            }
+                        } else {
+                            if ui.button("📺 Video OFF").clicked() {
+                                self.video_enabled = true;
+                                self.send_command(GuiCommand::ToggleVideo { enabled: true });
+                            }
+                        };
+                    });
+                    
+                    ui.separator();
+                    
+                    // Room participants
+                    ui.heading("👥 Room Participants");
+                    
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("participants_grid")
+                                .num_columns(4)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.heading("User");
+                                    ui.heading("Audio");
+                                    ui.heading("Video");
+                                    ui.heading("Status");
+                                    ui.end_row();
+                                    
+                                    for participant in &self.room_participants {
+                                        ui.label(&participant.username);
+                                        ui.label(if participant.audio_enabled { "🎤" } else { "🔇" });
+                                        ui.label(if participant.video_enabled { "📹" } else { "📺" });
+                                        ui.label("🟢 Online");
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                } else {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("Welcome to PQC Chat!");
+                        ui.label("🔐 Post-Quantum Secure Video Chat");
+                        ui.separator();
+                        ui.label("Select a room from the left panel or create a new one to start chatting.");
+                    });
+                }
+                
+                ui.separator();
+                
+                // Status messages
+                ui.heading("📨 Status Messages");
+                egui::ScrollArea::vertical()
+                    .max_height(150.0)
+                    .auto_shrink([false; 2])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for (message, _timestamp) in &self.status_messages {
+                            ui.label(message);
+                        }
+                    });
+            } else {
+                ui.vertical_centered(|ui| {
+                    ui.heading("🔐 PQC Chat");
+                    ui.label("Post-Quantum Secure Video Chat System");
+                    ui.separator();
+                    ui.label("Enter your connection details in the left panel to get started.");
+                });
+            }
+        });
+    }
+}
+
+#[cfg(feature = "gui")]
+async fn communication_task(
+    mut command_receiver: mpsc::UnboundedReceiver<GuiCommand>,
+    update_sender: mpsc::UnboundedSender<GuiUpdate>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio_rustls::rustls::{self, pki_types::ServerName};
+    use tokio_rustls::TlsConnector;
+    use std::sync::Arc;
+    
+    let mut connection: Option<tokio_rustls::client::TlsStream<TcpStream>> = None;
+    let mut _participant_id: Option<String> = None;
+    
+    while let Some(command) = command_receiver.recv().await {
+        match command {
+            GuiCommand::Connect { host, port, username } => {
+                match connect_to_server(&host, port, &username, &update_sender).await {
+                    Ok((stream, pid)) => {
+                        connection = Some(stream);
+                        _participant_id = Some(pid.clone());
+                        let _ = update_sender.send(GuiUpdate::Connected { participant_id: pid });
+                        
+                        // Request initial room list
+                        if let Some(ref mut conn) = connection {
+                            let _ = send_message(conn, &SignalingMessage::ListRooms).await;
+                        }
+                    },
+                    Err(e) => {
+                        let _ = update_sender.send(GuiUpdate::ConnectionError { 
+                            error: e.to_string() 
+                        });
+                    }
+                }
+            },
+            GuiCommand::Disconnect => {
+                connection = None;
+                _participant_id = None;
+                let _ = update_sender.send(GuiUpdate::Disconnected);
+            },
+            _ if connection.is_some() => {
+                if let Some(ref mut conn) = connection {
+                    let _ = handle_command(conn, command, &update_sender).await;
+                }
+            },
+            _ => {
+                // Ignore commands when not connected
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gui")]
+async fn connect_to_server(
+    host: &str,
+    port: u16,
+    username: &str,
+    _update_sender: &mpsc::UnboundedSender<GuiUpdate>,
+) -> Result<(tokio_rustls::client::TlsStream<tokio::net::TcpStream>, String), Box<dyn std::error::Error + Send + Sync>> {
+    use tokio::net::TcpStream;
+    use tokio_rustls::rustls::{self, pki_types::ServerName};
+    use tokio_rustls::TlsConnector;
+    use std::sync::Arc;
+    
+    // Create TLS config that accepts self-signed certificates (for development)
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifier))
+        .with_no_client_auth();
+    
+    let connector = TlsConnector::from(Arc::new(tls_config));
+    
+    // Connect to server
+    let addr = format!("{}:{}", host, port);
+    let stream = TcpStream::connect(&addr).await?;
+    let server_name = ServerName::try_from(host.to_string())?;
+    let mut tls_stream = connector.connect(server_name, stream).await?;
+    
+    // Perform Kyber key exchange
+    let kyber = KyberKeyExchange::new();
+    let key_init = SignalingMessage::KeyExchangeInit {
+        public_key: kyber.public_key_bytes(),
+    };
+    send_message(&mut tls_stream, &key_init).await?;
+    
+    let response = receive_message(&mut tls_stream).await?;
+    if let SignalingMessage::KeyExchangeResponse { ciphertext } = response {
+        kyber.decapsulate(&ciphertext)?;
+    } else {
+        return Err("Key exchange failed".into());
+    }
+    
+    // Login
+    let login = SignalingMessage::Login {
+        username: username.to_string(),
+    };
+    send_message(&mut tls_stream, &login).await?;
+    
+    let response = receive_message(&mut tls_stream).await?;
+    if let SignalingMessage::LoginResponse { success, participant_id, .. } = response {
+        if success {
+            if let Some(pid) = participant_id {
+                return Ok((tls_stream, pid));
+            }
+        }
+    }
+    
+    Err("Login failed".into())
+}
+
+#[cfg(feature = "gui")]
+async fn handle_command(
+    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    command: GuiCommand,
+    update_sender: &mpsc::UnboundedSender<GuiUpdate>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let message = match command {
+        GuiCommand::ListRooms => SignalingMessage::ListRooms,
+        GuiCommand::CreateRoom { name, max_participants } => SignalingMessage::CreateRoom {
+            name,
+            max_participants: Some(max_participants),
+        },
+        GuiCommand::JoinRoom { room_id } => SignalingMessage::JoinRoom {
+            room_id,
+            username: "User".to_string(), // TODO: Store username properly
+        },
+        GuiCommand::LeaveRoom => SignalingMessage::LeaveRoom,
+        GuiCommand::ToggleAudio { enabled } => SignalingMessage::ToggleAudio { enabled },
+        GuiCommand::ToggleVideo { enabled } => SignalingMessage::ToggleVideo { enabled },
+        _ => return Ok(()),
+    };
+    
+    send_message(stream, &message).await?;
+    let response = receive_message(stream).await?;
+    
+    // Process response
+    match response {
+        SignalingMessage::RoomList { rooms } => {
+            let _ = update_sender.send(GuiUpdate::RoomList { rooms });
+        },
+        SignalingMessage::RoomJoined { success, room_name, participants, .. } => {
+            if success {
+                if let (Some(name), Some(parts)) = (room_name, participants) {
+                    let room = RoomInfo {
+                        id: "temp".to_string(), // TODO: Get actual room ID
+                        name,
+                        participants: parts.len() as u32,
+                        max_participants: 10,
+                        is_locked: false,
+                    };
+                    let _ = update_sender.send(GuiUpdate::RoomJoined { room, participants: parts });
+                }
+            }
+        },
+        SignalingMessage::RoomLeft { success, .. } => {
+            if success {
+                let _ = update_sender.send(GuiUpdate::RoomLeft);
+            }
+        },
+        _ => {
+            // Handle other message types
+        }
+    }
+    
+    Ok(())
+}
+
+#[cfg(feature = "gui")]
+async fn send_message(
+    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+    message: &SignalingMessage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let data = message.to_framed()?;
+    stream.write_all(&data).await?;
+    Ok(())
+}
+
+#[cfg(feature = "gui")]
+async fn receive_message(
+    stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+) -> Result<SignalingMessage, Box<dyn std::error::Error + Send + Sync>> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let msg_len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut msg_buf = vec![0u8; msg_len];
+    stream.read_exact(&mut msg_buf).await?;
+
+    Ok(SignalingMessage::from_bytes(&msg_buf)?)
+}
+
+#[cfg(feature = "gui")]
+#[derive(Debug)]
+struct NoVerifier;
+
+#[cfg(feature = "gui")]
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}

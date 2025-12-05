@@ -74,7 +74,7 @@ setup_server() {
     echo ""
     echo "To also run a client on this server Pi:"
     echo "  - Copy client config: sudo cp config/server_client_pi.toml /etc/pqc-chat/client.toml"
-    echo "  - Run GUI client: ./target/release/pqc-gui"
+    echo "  - Run GUI client: ./target/release/pqc-enhanced-gui"
     echo "  - Or install client: sudo ./scripts/install_client.sh"
 }
 
@@ -98,8 +98,8 @@ setup_client() {
     fi
     
     echo "Client $CLIENT_NUM setup complete!"
-    echo "To start the GUI client, run: /opt/pqc-chat/bin/pqc-gui"
-    echo "Or to start with systemd: systemctl --user enable pqc-chat-client@default"
+    echo "To start the enhanced GUI, run: /opt/pqc-chat/bin/pqc-enhanced-gui"
+    echo "The GUI will show connection options to connect to the server at 192.168.10.101"
 }
 
 # Main deployment logic
@@ -202,7 +202,7 @@ setup_server_client() {
     echo ""
     echo "=== Server + Client Setup Complete ==="
     echo "Server is running as a service"
-    echo "To join the chat as a client, run: /opt/pqc-chat/bin/pqc-gui"
+    echo "To join the chat as a client, run: /opt/pqc-chat/bin/pqc-enhanced-gui"
     echo "The client will connect to the local server (127.0.0.1)"
 }
 

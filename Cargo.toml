@@ -9,13 +9,23 @@ license = "MIT"
 name = "pqc-server"
 path = "src/server/main.rs"
 
-[[bin]]
-name = "pqc-client"
-path = "src/client/main.rs"
+# Removed normal client - use interactive client instead
+# [[bin]]
+# name = "pqc-client" 
+# path = "src/client/main.rs"
+
+# Legacy stub GUI (kept for reference)
+# [[bin]]
+# name = "pqc-gui"
+# path = "src/gui/legacy_stub_main.rs"
 
 [[bin]]
-name = "pqc-gui"
-path = "src/gui/main.rs"
+name = "pqc-interactive"
+path = "src/interactive_client.rs"
+
+[[bin]]
+name = "pqc-enhanced-gui"
+path = "src/gui/enhanced_main.rs"
 
 [dependencies]
 # Async runtime

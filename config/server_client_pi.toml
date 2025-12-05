@@ -1,14 +1,14 @@
 # PQC Chat Client Configuration for Server Pi (localhost connection)
 # This allows the server Pi to also participate as a client in the chat
 
-# Server connection settings - connect to localhost since server is running locally
-server_host = "127.0.0.1"  # Connect to local server
+# Server connection settings - connect via ethernet network for consistency
+server_host = "192.168.10.101"  # Connect to server via ethernet IP
 signaling_port = 8443
 audio_port = 10000
 video_port = 10001
 
-# Alternative: You can also use the ethernet IP to test network connectivity
-# server_host = "192.168.10.101"
+# Alternative: You can also use localhost for testing
+# server_host = "127.0.0.1"
 
 # TLS certificate configuration
 # ca_certfile = "ca.crt"  # Optional: CA certificate for server verification

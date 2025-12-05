@@ -12,8 +12,8 @@ WorkingDirectory=/opt/pqc-chat
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=/home/%I/.Xauthority
 
-# Main client process (Rust binary)
-ExecStart=/opt/pqc-chat/bin/pqc-gui
+# Main client process (Enhanced GUI)
+ExecStart=/opt/pqc-chat/bin/pqc-enhanced-gui
 
 # Restart configuration
 Restart=on-failure

@@ -8,10 +8,10 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 # Build if needed
-if [ ! -f "target/release/pqc-gui" ]; then
-    echo "Building PQC Chat GUI..."
-    cargo build --release --bin pqc-gui --features gui
+if [ ! -f "target/release/pqc-enhanced-gui" ]; then
+    echo "Building PQC Chat Enhanced GUI..."
+    cargo build --release --bin pqc-enhanced-gui --features gui
 fi
 
-echo "Starting PQC Chat Client..."
-./target/release/pqc-gui "$@"
+echo "Starting PQC Chat Enhanced Client..."
+./target/release/pqc-enhanced-gui "$@"
