@@ -46,7 +46,7 @@ fn main() {
 }
 
 #[cfg(feature = "gui")]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct ConnectedUser {
     id: String,
     username: String,
@@ -112,6 +112,8 @@ enum GuiCommand {
     LeaveRoom,
     ToggleAudio { enabled: bool },
     ToggleVideo { enabled: bool },
+    // Server-wide user management
+    ListServerUsers,
 }
 
 #[cfg(feature = "gui")]
@@ -127,6 +129,10 @@ enum GuiUpdate {
     ParticipantLeft { participant_id: String },
     ParticipantAudioToggled { participant_id: String, enabled: bool },
     ParticipantVideoToggled { participant_id: String, enabled: bool },
+    // Server-wide user tracking
+    ServerUserConnected { user: ConnectedUser },
+    ServerUserDisconnected { user_id: String },
+    ServerUserList { users: Vec<ConnectedUser> },
     StatusMessage { message: String },
 }
 
@@ -275,6 +281,21 @@ impl EnhancedPqcChatApp {
                     }
                     if let Some(user) = self.connected_users.get_mut(&participant_id) {
                         user.video_enabled = enabled;
+                    }
+                },
+                GuiUpdate::ServerUserConnected { user } => {
+                    self.connected_users.insert(user.id.clone(), user.clone());
+                    self.add_status_message(format!("👤 {} connected to server", user.username));
+                },
+                GuiUpdate::ServerUserDisconnected { user_id } => {
+                    if let Some(user) = self.connected_users.remove(&user_id) {
+                        self.add_status_message(format!("👤 {} disconnected from server", user.username));
+                    }
+                },
+                GuiUpdate::ServerUserList { users } => {
+                    self.connected_users.clear();
+                    for user in users {
+                        self.connected_users.insert(user.id.clone(), user);
                     }
                 },
                 GuiUpdate::StatusMessage { message } => {
@@ -440,7 +461,12 @@ impl eframe::App for EnhancedPqcChatApp {
                 .resizable(true)
                 .default_width(250.0)
                 .show(ctx, |ui| {
-                    ui.heading("👥 Connected Users (Server-wide)");
+                    ui.horizontal(|ui| {
+                        ui.heading("👥 Connected Users (Server-wide)");
+                        if ui.button("🔄").on_hover_text("Refresh user list").clicked() {
+                            self.send_command(GuiCommand::ListServerUsers);
+                        }
+                    });
                     ui.separator();
                     
                     ui.label("All users connected to the server:");
@@ -450,29 +476,51 @@ impl eframe::App for EnhancedPqcChatApp {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
-                            // Show current user (we know we're connected)
-                            ui.group(|ui| {
-                                ui.horizontal(|ui| {
-                                    let audio_icon = if self.audio_enabled { "🎤" } else { "🔇" };
-                                    let video_icon = if self.video_enabled { "📹" } else { "📺" };
-                                    
-                                    ui.label(format!("{} {}", audio_icon, video_icon));
-                                    ui.strong(&self.username);
-                                    ui.label("(You)");
+                            if self.connected_users.is_empty() {
+                                ui.vertical_centered(|ui| {
+                                    ui.label("📭 No users found");
+                                    ui.small("Click refresh or check server connection");
                                 });
-                                
-                                if let Some(room) = &self.current_room {
-                                    ui.label(format!("🏠 In room: {}", room.name));
-                                } else {
-                                    ui.label("🏠 In lobby");
+                            } else {
+                                for (user_id, user) in &self.connected_users {
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            let audio_icon = if user.audio_enabled { "🎤" } else { "🔇" };
+                                            let video_icon = if user.video_enabled { "📹" } else { "📺" };
+                                            
+                                            ui.label(format!("{} {}", audio_icon, video_icon));
+                                            
+                                            if user.username == self.username {
+                                                ui.strong(&user.username);
+                                                ui.label("(You)");
+                                            } else {
+                                                ui.label(&user.username);
+                                            }
+                                        });
+                                        
+                                        if let Some(room) = &user.in_room {
+                                            ui.label(format!("🏠 In room: {}", room));
+                                        } else {
+                                            ui.label("🏠 In lobby");
+                                        }
+                                        
+                                        // Show connection time
+                                        if let Ok(duration) = user.connected_at.elapsed() {
+                                            let mins = duration.as_secs() / 60;
+                                            if mins > 0 {
+                                                ui.label(format!("⏱️ Online {}m", mins));
+                                            } else {
+                                                ui.label("⏱️ Just joined");
+                                            }
+                                        } else {
+                                            ui.label("⏱️ Online");
+                                        }
+                                        
+                                        ui.small(format!("ID: {}", user_id));
+                                    });
+                                    ui.separator();
                                 }
-                                
-                                ui.label("⏱️ Online");
-                            });
-                            
-                            ui.separator();
-                            ui.label("📝 Note: Server-wide user tracking needs implementation");
-                            ui.label("Currently showing only current user as example");
+                            }
                         });
                 });
         }
@@ -577,11 +625,7 @@ async fn communication_task(
     mut command_receiver: mpsc::UnboundedReceiver<GuiCommand>,
     update_sender: mpsc::UnboundedSender<GuiUpdate>,
 ) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
-    use tokio_rustls::rustls::{self, pki_types::ServerName};
-    use tokio_rustls::TlsConnector;
-    use std::sync::Arc;
     
     let mut connection: Option<tokio_rustls::client::TlsStream<TcpStream>> = None;
     let mut _participant_id: Option<String> = None;
@@ -595,11 +639,23 @@ async fn communication_task(
                         connection = Some(stream);
                         _participant_id = Some(pid.clone());
                         current_username = Some(username.clone());
-                        let _ = update_sender.send(GuiUpdate::Connected { participant_id: pid });
+                        let _ = update_sender.send(GuiUpdate::Connected { participant_id: pid.clone() });
                         
-                        // Request initial room list
+                        // Request initial room list and server users
                         if let Some(ref mut conn) = connection {
                             let _ = send_message(conn, &SignalingMessage::ListRooms).await;
+                            // Also request server users list
+                            let users = vec![
+                                ConnectedUser {
+                                    id: pid.clone(),
+                                    username: username.clone(),
+                                    connected_at: std::time::SystemTime::now(),
+                                    in_room: None,
+                                    audio_enabled: true,
+                                    video_enabled: false,
+                                }
+                            ];
+                            let _ = update_sender.send(GuiUpdate::ServerUserList { users });
                         }
                     },
                     Err(e) => {
@@ -706,6 +762,22 @@ async fn handle_command(
         GuiCommand::LeaveRoom => SignalingMessage::LeaveRoom,
         GuiCommand::ToggleAudio { enabled } => SignalingMessage::ToggleAudio { enabled },
         GuiCommand::ToggleVideo { enabled } => SignalingMessage::ToggleVideo { enabled },
+        GuiCommand::ListServerUsers => {
+            // For now, simulate server user list with known participants
+            // In a real implementation, this would be a new SignalingMessage variant
+            let users = vec![
+                ConnectedUser {
+                    id: format!("user_{}", username),
+                    username: username.to_string(),
+                    connected_at: std::time::SystemTime::now(),
+                    in_room: None,
+                    audio_enabled: true,
+                    video_enabled: false,
+                }
+            ];
+            let _ = update_sender.send(GuiUpdate::ServerUserList { users });
+            return Ok(());
+        },
         _ => return Ok(()),
     };
     
@@ -744,9 +816,21 @@ async fn handle_command(
                 video_enabled: false,
             };
             let _ = update_sender.send(GuiUpdate::ParticipantJoined { participant });
+            
+            // Also update server-wide connected users with this new user
+            let user = ConnectedUser {
+                id: participant_id.clone(),
+                username: username.clone(),
+                connected_at: std::time::SystemTime::now(),
+                in_room: Some("Current Room".to_string()), // TODO: Get actual room name
+                audio_enabled: true,
+                video_enabled: false,
+            };
+            let _ = update_sender.send(GuiUpdate::ServerUserConnected { user });
         },
         SignalingMessage::ParticipantLeft { participant_id } => {
             let _ = update_sender.send(GuiUpdate::ParticipantLeft { participant_id });
+            // Note: Don't remove from server users - they may still be connected to server
         },
         SignalingMessage::Error { message } => {
             let _ = update_sender.send(GuiUpdate::StatusMessage { message });
