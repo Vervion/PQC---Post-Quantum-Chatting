@@ -66,6 +66,9 @@ sudo nmcli connection modify eth0 ipv4.method manual ipv4.addresses 192.168.10.1
 # Replace "YourWiFiName" with your actual WiFi connection name from nmcli connection show
 sudo nmcli connection modify "YourWiFiName" ipv4.route-metric 100
 
+# Enable auto-connect on boot (IMPORTANT!)
+sudo nmcli connection modify eth0 connection.autoconnect yes
+
 # Apply changes
 sudo nmcli connection down eth0 && sudo nmcli connection up eth0
 ```
@@ -79,6 +82,9 @@ sudo nmcli connection modify eth0 ipv4.method manual ipv4.addresses 192.168.10.1
 # Replace "YourWiFiName" with your actual WiFi connection name from nmcli connection show
 sudo nmcli connection modify "YourWiFiName" ipv4.route-metric 100
 
+# Enable auto-connect on boot (IMPORTANT!)
+sudo nmcli connection modify eth0 connection.autoconnect yes
+
 # Apply changes
 sudo nmcli connection down eth0 && sudo nmcli connection up eth0
 ```
@@ -91,6 +97,9 @@ sudo nmcli connection modify eth0 ipv4.method manual ipv4.addresses 192.168.10.1
 # Configure WiFi for internet (lower metric = higher priority)
 # Replace "YourWiFiName" with your actual WiFi connection name from nmcli connection show
 sudo nmcli connection modify "YourWiFiName" ipv4.route-metric 100
+
+# Enable auto-connect on boot (IMPORTANT!)
+sudo nmcli connection modify eth0 connection.autoconnect yes
 
 # Apply changes
 sudo nmcli connection down eth0 && sudo nmcli connection up eth0
