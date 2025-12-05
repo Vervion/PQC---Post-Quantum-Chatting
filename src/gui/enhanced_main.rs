@@ -579,6 +579,7 @@ async fn communication_task(
     
     let mut connection: Option<tokio_rustls::client::TlsStream<TcpStream>> = None;
     let mut _participant_id: Option<String> = None;
+    let mut current_username: Option<String> = None;
     
     while let Some(command) = command_receiver.recv().await {
         match command {
@@ -587,6 +588,7 @@ async fn communication_task(
                     Ok((stream, pid)) => {
                         connection = Some(stream);
                         _participant_id = Some(pid.clone());
+                        current_username = Some(username.clone());
                         let _ = update_sender.send(GuiUpdate::Connected { participant_id: pid });
                         
                         // Request initial room list
@@ -604,11 +606,13 @@ async fn communication_task(
             GuiCommand::Disconnect => {
                 connection = None;
                 _participant_id = None;
+                current_username = None;
                 let _ = update_sender.send(GuiUpdate::Disconnected);
             },
             _ if connection.is_some() => {
                 if let Some(ref mut conn) = connection {
-                    let _ = handle_command(conn, command, &update_sender).await;
+                    let username = current_username.as_deref().unwrap_or("User");
+                    let _ = handle_command(conn, command, &update_sender, username).await;
                 }
             },
             _ => {
@@ -681,6 +685,7 @@ async fn handle_command(
     stream: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
     command: GuiCommand,
     update_sender: &mpsc::UnboundedSender<GuiUpdate>,
+    username: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let message = match command {
         GuiCommand::ListRooms => SignalingMessage::ListRooms,
@@ -690,7 +695,7 @@ async fn handle_command(
         },
         GuiCommand::JoinRoom { room_id } => SignalingMessage::JoinRoom {
             room_id,
-            username: "User".to_string(), // TODO: Store username properly
+            username: username.to_string(),
         },
         GuiCommand::LeaveRoom => SignalingMessage::LeaveRoom,
         GuiCommand::ToggleAudio { enabled } => SignalingMessage::ToggleAudio { enabled },
