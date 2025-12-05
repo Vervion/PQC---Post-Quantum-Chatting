@@ -19,7 +19,7 @@ detect_pi_role() {
     LOCAL_IP=$(hostname -I | awk '{print $1}')
     case $LOCAL_IP in
         "192.168.10.101")
-            echo "server"
+            echo "server-client"
             ;;
         "192.168.10.102")
             echo "client1"
@@ -144,6 +144,9 @@ main() {
     case $ROLE in
         "server")
             setup_server
+            ;;
+        "server-client")
+            setup_server_client
             ;;
         "client1")
             setup_client 1
