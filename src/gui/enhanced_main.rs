@@ -150,9 +150,9 @@ impl EnhancedPqcChatApp {
         });
 
         Self {
-            server_host: "127.0.0.1".to_string(),
+            server_host: "192.168.10.101".to_string(),
             server_port: "8443".to_string(),
-            username: "User".to_string(),
+            username: std::env::var("USER").unwrap_or_else(|_| "PiUser".to_string()),
             is_connected: false,
             connection_status: "Disconnected".to_string(),
             rooms: Vec::new(),
@@ -724,6 +724,21 @@ async fn handle_command(
             if success {
                 let _ = update_sender.send(GuiUpdate::RoomLeft);
             }
+        },
+        SignalingMessage::ParticipantJoined { participant_id, username } => {
+            let participant = ParticipantInfo {
+                id: participant_id.clone(),
+                username: username.clone(),
+                audio_enabled: true,
+                video_enabled: false,
+            };
+            let _ = update_sender.send(GuiUpdate::ParticipantJoined { participant });
+        },
+        SignalingMessage::ParticipantLeft { participant_id } => {
+            let _ = update_sender.send(GuiUpdate::ParticipantLeft { participant_id });
+        },
+        SignalingMessage::Error { message } => {
+            let _ = update_sender.send(GuiUpdate::StatusMessage { message });
         },
         _ => {
             // Handle other message types
