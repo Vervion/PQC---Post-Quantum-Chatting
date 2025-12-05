@@ -39,72 +39,93 @@ The configurations are designed to work together without interference.
 
 On **each** Raspberry Pi, you need to configure a static IP address.
 
-### Method 1: Using systemd-networkd (Recommended for newer Raspberry Pi OS)
+**First, check which network management system your Pi uses:**
+```bash
+# Check if NetworkManager is running (most likely on Pi 5)
+nmcli connection show
 
-1. **On each Pi, create ethernet network configuration file:**
+# If NetworkManager is not available, check for systemd-networkd
+systemctl status systemd-networkd
+```
+
+### Method 1: Using NetworkManager (Most common on Raspberry Pi 5)
+
+**First, check current connections:**
+```bash
+nmcli connection show
+```
+
+Configure each Pi with NetworkManager:
+
+**For Pi 1 (Server - 192.168.10.101):**
+```bash
+# Configure ethernet for static IP
+sudo nmcli connection modify eth0 ipv4.method manual ipv4.addresses 192.168.10.101/24 ipv4.dns "8.8.8.8,8.8.4.4" ipv4.route-metric 200
+
+# Configure WiFi for internet (lower metric = higher priority)
+# Replace "YourWiFiName" with your actual WiFi connection name from nmcli connection show
+sudo nmcli connection modify "YourWiFiName" ipv4.route-metric 100
+
+# Apply changes
+sudo nmcli connection down eth0 && sudo nmcli connection up eth0
+```
+
+**For Pi 2 (Client 1 - 192.168.10.102):**
+```bash
+# Configure ethernet for static IP
+sudo nmcli connection modify eth0 ipv4.method manual ipv4.addresses 192.168.10.102/24 ipv4.dns "8.8.8.8,8.8.4.4" ipv4.route-metric 200
+
+# Configure WiFi for internet (lower metric = higher priority)
+# Replace "YourWiFiName" with your actual WiFi connection name from nmcli connection show
+sudo nmcli connection modify "YourWiFiName" ipv4.route-metric 100
+
+# Apply changes
+sudo nmcli connection down eth0 && sudo nmcli connection up eth0
+```
+
+**For Pi 3 (Client 2 - 192.168.10.103):**
+```bash
+# Configure ethernet for static IP
+sudo nmcli connection modify eth0 ipv4.method manual ipv4.addresses 192.168.10.103/24 ipv4.dns "8.8.8.8,8.8.4.4" ipv4.route-metric 200
+
+# Configure WiFi for internet (lower metric = higher priority)
+# Replace "YourWiFiName" with your actual WiFi connection name from nmcli connection show
+sudo nmcli connection modify "YourWiFiName" ipv4.route-metric 100
+
+# Apply changes
+sudo nmcli connection down eth0 && sudo nmcli connection up eth0
+```
+
+### Method 2: Using systemd-networkd (Alternative method)
+
+If your Raspberry Pi uses systemd-networkd instead of NetworkManager:
+
+1. **Create ethernet network configuration file:**
 
 ```bash
 sudo nano /etc/systemd/network/10-eth0.network
 ```
 
-2. **For Raspberry Pi 1 (Server - 192.168.10.101):**
+2. **For each Pi, use the appropriate IP configuration:**
+
 ```ini
+# Pi 1: 192.168.10.101, Pi 2: 192.168.10.102, Pi 3: 192.168.10.103
 [Match]
 Name=eth0
 
 [Network]
 DHCP=no
-Address=192.168.10.101/24
-# No gateway on ethernet - WLAN will handle internet routing
+Address=192.168.10.XXX/24  # Replace XXX with 101, 102, or 103
 DNS=8.8.8.8
 DNS=8.8.4.4
 
 [Route]
-# Route PQC Chat subnet through ethernet
 Destination=192.168.10.0/24
 Gateway=0.0.0.0
 Metric=100
 ```
 
-3. **For Raspberry Pi 2 (Client 1 - 192.168.10.102):**
-```ini
-[Match]
-Name=eth0
-
-[Network]
-DHCP=no
-Address=192.168.10.102/24
-# No gateway on ethernet - WLAN will handle internet routing
-DNS=8.8.8.8
-DNS=8.8.4.4
-
-[Route]
-# Route PQC Chat subnet through ethernet
-Destination=192.168.10.0/24
-Gateway=0.0.0.0
-Metric=100
-```
-
-4. **For Raspberry Pi 3 (Client 2 - 192.168.10.103):**
-```ini
-[Match]
-Name=eth0
-
-[Network]
-DHCP=no
-Address=192.168.10.103/24
-# No gateway on ethernet - WLAN will handle internet routing
-DNS=8.8.8.8
-DNS=8.8.4.4
-
-[Route]
-# Route PQC Chat subnet through ethernet
-Destination=192.168.10.0/24
-Gateway=0.0.0.0
-Metric=100
-```
-
-5. **Create WLAN configuration for internet access (on each Pi):**
+3. **Create WLAN configuration:**
 
 ```bash
 sudo nano /etc/systemd/network/20-wlan0.network
@@ -116,17 +137,16 @@ Name=wlan0
 
 [Network]
 DHCP=yes
-# WLAN will get default gateway for internet access
 ```
 
-6. **Enable systemd-networkd on each Pi:**
+4. **Enable systemd-networkd:**
 ```bash
 sudo systemctl enable systemd-networkd
 sudo systemctl start systemd-networkd
 sudo systemctl disable dhcpcd
 ```
 
-### Method 2: Using dhcpcd (Legacy method)
+### Method 3: Using dhcpcd (Legacy method)
 
 If your Raspberry Pi OS still uses dhcpcd, edit `/etc/dhcpcd.conf`:
 
