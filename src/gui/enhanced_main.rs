@@ -123,8 +123,8 @@ struct EnhancedPqcChatApp {
     audio_enabled: bool,
     video_enabled: bool,
 
-    // Chat state
-    chat_messages: Vec<ChatMessage>,
+    // Chat state - per room
+    room_chat_history: HashMap<String, Vec<ChatMessage>>,  // room_id -> messages
     message_input: String,
     
     // UI state
@@ -210,7 +210,7 @@ impl EnhancedPqcChatApp {
             room_participants: Vec::new(),
             connected_users: HashMap::new(),
             user_list_scroll: 0.0,
-            chat_messages: Vec::new(),
+            room_chat_history: HashMap::new(),
             message_input: String::new(),
             audio_enabled: true,
             video_enabled: true,
@@ -359,23 +359,29 @@ impl EnhancedPqcChatApp {
                 GuiUpdate::ChatMessageReceived { message } => {
                     eprintln!("DEBUG: GuiUpdate::ChatMessageReceived - from {} ({}): {}", message.sender_username, message.sender_id, message.content);
                     
-                    // Check for duplicate - don't add if we already have this message
-                    // (this happens when we optimistically add our own message, then get the broadcast)
-                    let is_duplicate = self.chat_messages.iter().any(|m| {
-                        m.content == message.content && 
-                        m.sender_username == message.sender_username &&
-                        m.timestamp.duration_since(message.timestamp).unwrap_or_default().as_secs() < 2
-                    });
-                    
-                    if !is_duplicate {
-                        self.chat_messages.push(message);
-                        // Keep only last 100 messages
-                        if self.chat_messages.len() > 100 {
-                            self.chat_messages.remove(0);
+                    // Only add message if we're in a room
+                    if let Some(ref room) = self.current_room {
+                        let room_id = room.id.clone();
+                        let chat_history = self.room_chat_history.entry(room_id.clone()).or_insert_with(Vec::new);
+                        
+                        // Check for duplicate - don't add if we already have this message
+                        // (this happens when we optimistically add our own message, then get the broadcast)
+                        let is_duplicate = chat_history.iter().any(|m| {
+                            m.content == message.content && 
+                            m.sender_username == message.sender_username &&
+                            m.timestamp.duration_since(message.timestamp).unwrap_or_default().as_secs() < 2
+                        });
+                        
+                        if !is_duplicate {
+                            chat_history.push(message);
+                            // Keep only last 100 messages per room
+                            if chat_history.len() > 100 {
+                                chat_history.remove(0);
+                            }
+                            eprintln!("DEBUG: Added message to room {}. Total messages: {}", room_id, chat_history.len());
+                        } else {
+                            eprintln!("DEBUG: Skipped duplicate message");
                         }
-                        eprintln!("DEBUG: Added message. Total messages in chat: {}", self.chat_messages.len());
-                    } else {
-                        eprintln!("DEBUG: Skipped duplicate message");
                     }
                 },
                 GuiUpdate::StatusMessage { message } => {
@@ -610,38 +616,45 @@ impl eframe::App for EnhancedPqcChatApp {
                 });
         }
 
-        // Chat input bottom panel (global) - anchor the input at absolute bottom
-        egui::TopBottomPanel::bottom("chat_input_panel")
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let response = ui.text_edit_singleline(&mut self.message_input);
+        // Chat input bottom panel - only show when in a room
+        if self.current_room.is_some() {
+            egui::TopBottomPanel::bottom("chat_input_panel")
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let response = ui.text_edit_singleline(&mut self.message_input);
 
-                    let send_clicked = ui.button("📤 Send").clicked();
-                    let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let send_clicked = ui.button("📤 Send").clicked();
+                        let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                    if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
-                        let content = self.message_input.trim().to_string();
+                        if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
+                            let content = self.message_input.trim().to_string();
 
-                        // Optimistic update: show your own message immediately for better UX
-                        // The deduplication logic will prevent it from showing twice when broadcast returns
-                        self.chat_messages.push(ChatMessage {
-                            sender_id: "optimistic".to_string(),
-                            sender_username: self.username.clone(),
-                            content: content.clone(),
-                            timestamp: std::time::SystemTime::now(),
-                        });
-                        
-                        if self.chat_messages.len() > 100 {
-                            self.chat_messages.remove(0);
+                            // Optimistic update: show your own message immediately for better UX
+                            // The deduplication logic will prevent it from showing twice when broadcast returns
+                            if let Some(ref room) = self.current_room {
+                                let room_id = room.id.clone();
+                                let chat_history = self.room_chat_history.entry(room_id).or_insert_with(Vec::new);
+                                
+                                chat_history.push(ChatMessage {
+                                    sender_id: "optimistic".to_string(),
+                                    sender_username: self.username.clone(),
+                                    content: content.clone(),
+                                    timestamp: std::time::SystemTime::now(),
+                                });
+                                
+                                if chat_history.len() > 100 {
+                                    chat_history.remove(0);
+                                }
+                            }
+
+                            // Send message - server will broadcast to everyone (including us)
+                            self.send_command(GuiCommand::SendMessage { content });
+                            self.message_input.clear();
+                            response.request_focus();
                         }
-
-                        // Send message - server will broadcast to everyone (including us)
-                        self.send_command(GuiCommand::SendMessage { content });
-                        self.message_input.clear();
-                        response.request_focus();
-                    }
+                    });
                 });
-            });
+        }
 
         // Central panel - Chat and room controls
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -693,26 +706,40 @@ impl eframe::App for EnhancedPqcChatApp {
                             .max_height(chat_max_h)
                             .stick_to_bottom(true)
                             .show(ui, |ui| {
-                                if self.chat_messages.is_empty() {
+                                // Get messages for current room
+                                let messages = if let Some(ref room) = self.current_room {
+                                    self.room_chat_history.get(&room.id)
+                                } else {
+                                    None
+                                };
+                                
+                                if let Some(msgs) = messages {
+                                    if msgs.is_empty() {
+                                        ui.vertical_centered(|ui| {
+                                            ui.label("🗨️ No messages yet");
+                                            ui.small("Start the conversation!");
+                                        });
+                                    } else {
+                                        for msg in msgs {
+                                            ui.group(|ui| {
+                                                ui.horizontal(|ui| {
+                                                    if msg.sender_username == self.username {
+                                                        ui.strong("You");
+                                                    } else {
+                                                        ui.label(&msg.sender_username);
+                                                    }
+                                                    ui.small(format_time(msg.timestamp));
+                                                });
+                                                ui.label(&msg.content);
+                                            });
+                                            ui.separator();
+                                        }
+                                    }
+                                } else {
                                     ui.vertical_centered(|ui| {
                                         ui.label("🗨️ No messages yet");
                                         ui.small("Start the conversation!");
                                     });
-                                } else {
-                                    for msg in &self.chat_messages {
-                                        ui.group(|ui| {
-                                            ui.horizontal(|ui| {
-                                                if msg.sender_username == self.username {
-                                                    ui.strong("You");
-                                                } else {
-                                                    ui.label(&msg.sender_username);
-                                                }
-                                                ui.small(format_time(msg.timestamp));
-                                            });
-                                            ui.label(&msg.content);
-                                        });
-                                        ui.separator();
-                                    }
                                 }
                             });
                     });
