@@ -519,8 +519,7 @@ impl eframe::App for EnhancedPqcChatApp {
             });
 
         // Right panel - Connected Users
-        // Hide the server-wide users panel when we're inside a room (to avoid layout issues)
-        if self.show_users_panel && self.current_room.is_none() {
+        if self.show_users_panel {
             egui::SidePanel::right("users_panel")
                 .resizable(true)
                 .default_width(250.0)
@@ -630,14 +629,15 @@ impl eframe::App for EnhancedPqcChatApp {
                     ui.separator();
                     
                     // Main content area - split between chat and participants
-                    ui.horizontal(|ui| {
-                        // Chat area (70% width)
-                        ui.set_min_width(ui.available_width() * 0.7);
+                    let available_width = ui.available_width();
+                    ui.columns(2, |columns| {
+                        // Chat area (left column)
+                        columns[0].set_width(available_width * 0.65);
 
                         // Use a bottom-up layout so the message input stays anchored to the bottom
                         // and the chat feed occupies the space above it.
-                        let available = ui.available_size();
-                        ui.allocate_ui_with_layout(available, egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                        let available = columns[0].available_size();
+                        columns[0].allocate_ui_with_layout(available, egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                             // Message input (anchored to bottom)
                             ui.horizontal(|ui| {
                                 let response = ui.text_edit_singleline(&mut self.message_input);
@@ -647,6 +647,19 @@ impl eframe::App for EnhancedPqcChatApp {
 
                                 if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
                                     let content = self.message_input.trim().to_string();
+                                    
+                                    // Add your own message immediately to the chat
+                                    let chat_msg = ChatMessage {
+                                        sender_id: "self".to_string(),
+                                        sender_username: self.username.clone(),
+                                        content: content.clone(),
+                                        timestamp: std::time::SystemTime::now(),
+                                    };
+                                    self.chat_messages.push(chat_msg);
+                                    if self.chat_messages.len() > 100 {
+                                        self.chat_messages.remove(0);
+                                    }
+                                    
                                     self.send_command(GuiCommand::SendMessage { content });
                                     self.message_input.clear();
                                     response.request_focus();
@@ -687,32 +700,28 @@ impl eframe::App for EnhancedPqcChatApp {
                                 });
                         });
 
-                        ui.separator();
+                        // Participants area (right column)
+                        columns[1].heading("👥 Participants");
 
-                        // Participants area (30% width)
-                        ui.vertical(|ui| {
-                            ui.heading("👥 Participants");
+                        egui::ScrollArea::vertical()
+                            .show(&mut columns[1], |ui| {
+                                for participant in &self.room_participants {
+                                    ui.horizontal(|ui| {
+                                        let audio_icon = if participant.audio_enabled { "🎤" } else { "🔇" };
+                                        let video_icon = if participant.video_enabled { "📹" } else { "📺" };
 
-                            egui::ScrollArea::vertical()
-                                .show(ui, |ui| {
-                                    for participant in &self.room_participants {
-                                        ui.horizontal(|ui| {
-                                            let audio_icon = if participant.audio_enabled { "🎤" } else { "🔇" };
-                                            let video_icon = if participant.video_enabled { "📹" } else { "📺" };
+                                        ui.label(format!("{} {}", audio_icon, video_icon));
 
-                                            ui.label(format!("{} {}", audio_icon, video_icon));
-
-                                            if participant.username == self.username {
-                                                ui.strong(&participant.username);
-                                                ui.small("(You)");
-                                            } else {
-                                                ui.label(&participant.username);
-                                            }
-                                        });
-                                        ui.separator();
-                                    }
-                                });
-                        });
+                                        if participant.username == self.username {
+                                            ui.strong(&participant.username);
+                                            ui.small("(You)");
+                                        } else {
+                                            ui.label(&participant.username);
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+                            });
                     });
                 } else {
                     ui.vertical_centered(|ui| {
