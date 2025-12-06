@@ -519,7 +519,8 @@ impl eframe::App for EnhancedPqcChatApp {
             });
 
         // Right panel - Connected Users
-        if self.show_users_panel {
+        // Hide the server-wide users panel when we're inside a room (to avoid layout issues)
+        if self.show_users_panel && self.current_room.is_none() {
             egui::SidePanel::right("users_panel")
                 .resizable(true)
                 .default_width(250.0)
@@ -631,17 +632,37 @@ impl eframe::App for EnhancedPqcChatApp {
                     // Main content area - split between chat and participants
                     ui.horizontal(|ui| {
                         // Chat area (70% width)
-                        ui.vertical(|ui| {
-                            ui.set_min_width(ui.available_width() * 0.7);
-                            
-                            ui.heading("💬 Chat");
-                            
-                            // Chat messages area
-                            let chat_height = ui.available_height() - 60.0; // Reserve space for input
+                        ui.set_min_width(ui.available_width() * 0.7);
+
+                        // Use a bottom-up layout so the message input stays anchored to the bottom
+                        // and the chat feed occupies the space above it.
+                        let available = ui.available_size();
+                        ui.allocate_ui_with_layout(available, egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                            // Message input (anchored to bottom)
+                            ui.horizontal(|ui| {
+                                let response = ui.text_edit_singleline(&mut self.message_input);
+
+                                let send_clicked = ui.button("📤 Send").clicked();
+                                let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                                if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
+                                    let content = self.message_input.trim().to_string();
+                                    self.send_command(GuiCommand::SendMessage { content });
+                                    self.message_input.clear();
+                                    response.request_focus();
+                                }
+                            });
+
+                            ui.separator();
+
+                            // Chat messages area fills the remaining space above the input
+                            let chat_height = ui.available_height();
                             egui::ScrollArea::vertical()
                                 .max_height(chat_height)
                                 .stick_to_bottom(true)
                                 .show(ui, |ui| {
+                                    ui.heading("💬 Chat");
+
                                     if self.chat_messages.is_empty() {
                                         ui.vertical_centered(|ui| {
                                             ui.label("🗨️ No messages yet");
@@ -664,40 +685,23 @@ impl eframe::App for EnhancedPqcChatApp {
                                         }
                                     }
                                 });
-                            
-                            ui.separator();
-                            
-                            // Message input
-                            ui.horizontal(|ui| {
-                                let response = ui.text_edit_singleline(&mut self.message_input);
-                                
-                                let send_clicked = ui.button("📤 Send").clicked();
-                                let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                
-                                if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
-                                    let content = self.message_input.trim().to_string();
-                                    self.send_command(GuiCommand::SendMessage { content });
-                                    self.message_input.clear();
-                                    response.request_focus();
-                                }
-                            });
                         });
-                        
+
                         ui.separator();
-                        
+
                         // Participants area (30% width)
                         ui.vertical(|ui| {
                             ui.heading("👥 Participants");
-                            
+
                             egui::ScrollArea::vertical()
                                 .show(ui, |ui| {
                                     for participant in &self.room_participants {
                                         ui.horizontal(|ui| {
                                             let audio_icon = if participant.audio_enabled { "🎤" } else { "🔇" };
                                             let video_icon = if participant.video_enabled { "📹" } else { "📺" };
-                                            
+
                                             ui.label(format!("{} {}", audio_icon, video_icon));
-                                            
+
                                             if participant.username == self.username {
                                                 ui.strong(&participant.username);
                                                 ui.small("(You)");
