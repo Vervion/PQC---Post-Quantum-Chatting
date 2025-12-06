@@ -123,8 +123,8 @@ struct EnhancedPqcChatApp {
     audio_enabled: bool,
     video_enabled: bool,
 
-    // Chat state
-    chat_messages: Vec<ChatMessage>,
+    // Chat state - separate history per room
+    chat_messages: HashMap<String, Vec<ChatMessage>>,  // room_id -> messages
     message_input: String,
     
     // UI state
@@ -210,7 +210,7 @@ impl EnhancedPqcChatApp {
             room_participants: Vec::new(),
             connected_users: HashMap::new(),
             user_list_scroll: 0.0,
-            chat_messages: Vec::new(),
+            chat_messages: HashMap::new(),
             message_input: String::new(),
             audio_enabled: true,
             video_enabled: true,
@@ -289,6 +289,10 @@ impl EnhancedPqcChatApp {
                         is_locked: room.is_locked,
                     });
                     self.room_participants = participants;
+                    
+                    // Initialize chat history for this room if it doesn't exist
+                    self.chat_messages.entry(room.id.clone()).or_insert_with(Vec::new);
+                    
                     self.add_status_message(format!("🎉 Joined room: {} with {} participants", room.name, self.room_participants.len()));
                 },
                 GuiUpdate::RoomLeft => {
@@ -297,6 +301,7 @@ impl EnhancedPqcChatApp {
                     }
                     self.current_room = None;
                     self.room_participants.clear();
+                    self.message_input.clear();  // Clear input when leaving room
                 },
                 GuiUpdate::ParticipantJoined { participant } => {
                     eprintln!("DEBUG: ParticipantJoined - {} ({})", participant.username, participant.id);
@@ -357,10 +362,14 @@ impl EnhancedPqcChatApp {
                     }
                 },
                 GuiUpdate::ChatMessageReceived { message } => {
-                    self.chat_messages.push(message);
-                    // Keep only last 100 messages
-                    if self.chat_messages.len() > 100 {
-                        self.chat_messages.remove(0);
+                    // Store message in the current room's chat history
+                    if let Some(room) = &self.current_room {
+                        let messages = self.chat_messages.entry(room.id.clone()).or_insert_with(Vec::new);
+                        messages.push(message);
+                        // Keep only last 100 messages per room
+                        if messages.len() > 100 {
+                            messages.remove(0);
+                        }
                     }
                 },
                 GuiUpdate::StatusMessage { message } => {
@@ -595,36 +604,41 @@ impl eframe::App for EnhancedPqcChatApp {
                 });
         }
 
-        // Chat input bottom panel (global) - anchor the input at absolute bottom
-        egui::TopBottomPanel::bottom("chat_input_panel")
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let response = ui.text_edit_singleline(&mut self.message_input);
+        // Chat input bottom panel - only show when in a room
+        if self.is_connected && self.current_room.is_some() {
+            egui::TopBottomPanel::bottom("chat_input_panel")
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let response = ui.text_edit_singleline(&mut self.message_input);
 
-                    let send_clicked = ui.button("📤 Send").clicked();
-                    let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let send_clicked = ui.button("📤 Send").clicked();
+                        let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
-                    if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
-                        let content = self.message_input.trim().to_string();
+                        if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
+                            let content = self.message_input.trim().to_string();
 
-                        // Optimistic update: append own message immediately
-                        self.chat_messages.push(ChatMessage {
-                            sender_id: "self".to_string(),
-                            sender_username: self.username.clone(),
-                            content: content.clone(),
-                            timestamp: std::time::SystemTime::now(),
-                        });
+                            // Optimistic update: append own message immediately to current room's chat
+                            if let Some(room) = &self.current_room {
+                                let messages = self.chat_messages.entry(room.id.clone()).or_insert_with(Vec::new);
+                                messages.push(ChatMessage {
+                                    sender_id: "self".to_string(),
+                                    sender_username: self.username.clone(),
+                                    content: content.clone(),
+                                    timestamp: std::time::SystemTime::now(),
+                                });
 
-                        if self.chat_messages.len() > 100 {
-                            self.chat_messages.remove(0);
+                                if messages.len() > 100 {
+                                    messages.remove(0);
+                                }
+                            }
+
+                            self.send_command(GuiCommand::SendMessage { content });
+                            self.message_input.clear();
+                            response.request_focus();
                         }
-
-                        self.send_command(GuiCommand::SendMessage { content });
-                        self.message_input.clear();
-                        response.request_focus();
-                    }
+                    });
                 });
-            });
+        }
 
         // Central panel - Chat and room controls
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -671,18 +685,23 @@ impl eframe::App for EnhancedPqcChatApp {
                         let chat_max_h = ui.available_height();
                         ui.set_min_height(chat_max_h);
                         
+                        // Get messages for current room
+                        let current_room_id = room.id.clone();
+                        let empty_vec = Vec::new();
+                        let messages = self.chat_messages.get(&current_room_id).unwrap_or(&empty_vec);
+                        
                         egui::ScrollArea::vertical()
                             .id_source("chat_scroll_area")
                             .max_height(chat_max_h)
                             .stick_to_bottom(true)
                             .show(ui, |ui| {
-                                if self.chat_messages.is_empty() {
+                                if messages.is_empty() {
                                     ui.vertical_centered(|ui| {
                                         ui.label("🗨️ No messages yet");
                                         ui.small("Start the conversation!");
                                     });
                                 } else {
-                                    for msg in &self.chat_messages {
+                                    for msg in messages {
                                         ui.group(|ui| {
                                             ui.horizontal(|ui| {
                                                 if msg.sender_username == self.username {
@@ -851,9 +870,11 @@ async fn communication_task(
                 } => {
                     match result {
                         Ok(msg) => {
+                            eprintln!("DEBUG: Received server message: {:?}", std::mem::discriminant(&msg));
                             process_server_message(msg, &update_sender).await;
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            eprintln!("DEBUG: Connection error while receiving: {:?}", e);
                             // Connection closed
                             connection = None;
                             let _ = update_sender.send(GuiUpdate::Disconnected);
@@ -1076,6 +1097,7 @@ async fn process_server_message(
     // Handle unsolicited broadcasts from the server (messages, participant joins/leaves, etc.)
     match message {
         SignalingMessage::MessageReceived { sender_id, sender_username, content, timestamp } => {
+            eprintln!("DEBUG: Received message from {} (ID: {}): {}", sender_username, sender_id, content);
             let chat_message = ChatMessage {
                 sender_id,
                 sender_username,
