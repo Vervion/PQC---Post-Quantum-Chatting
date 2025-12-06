@@ -357,10 +357,25 @@ impl EnhancedPqcChatApp {
                     }
                 },
                 GuiUpdate::ChatMessageReceived { message } => {
-                    self.chat_messages.push(message);
-                    // Keep only last 100 messages
-                    if self.chat_messages.len() > 100 {
-                        self.chat_messages.remove(0);
+                    eprintln!("DEBUG: GuiUpdate::ChatMessageReceived - from {} ({}): {}", message.sender_username, message.sender_id, message.content);
+                    
+                    // Check for duplicate - don't add if we already have this message
+                    // (this happens when we optimistically add our own message, then get the broadcast)
+                    let is_duplicate = self.chat_messages.iter().any(|m| {
+                        m.content == message.content && 
+                        m.sender_username == message.sender_username &&
+                        m.timestamp.duration_since(message.timestamp).unwrap_or_default().as_secs() < 2
+                    });
+                    
+                    if !is_duplicate {
+                        self.chat_messages.push(message);
+                        // Keep only last 100 messages
+                        if self.chat_messages.len() > 100 {
+                            self.chat_messages.remove(0);
+                        }
+                        eprintln!("DEBUG: Added message. Total messages in chat: {}", self.chat_messages.len());
+                    } else {
+                        eprintln!("DEBUG: Skipped duplicate message");
                     }
                 },
                 GuiUpdate::StatusMessage { message } => {
@@ -607,7 +622,20 @@ impl eframe::App for EnhancedPqcChatApp {
                     if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
                         let content = self.message_input.trim().to_string();
 
-                        // Send message - the server broadcast will update UI for everyone
+                        // Optimistic update: show your own message immediately for better UX
+                        // The deduplication logic will prevent it from showing twice when broadcast returns
+                        self.chat_messages.push(ChatMessage {
+                            sender_id: "optimistic".to_string(),
+                            sender_username: self.username.clone(),
+                            content: content.clone(),
+                            timestamp: std::time::SystemTime::now(),
+                        });
+                        
+                        if self.chat_messages.len() > 100 {
+                            self.chat_messages.remove(0);
+                        }
+
+                        // Send message - server will broadcast to everyone (including us)
                         self.send_command(GuiCommand::SendMessage { content });
                         self.message_input.clear();
                         response.request_focus();
@@ -840,9 +868,11 @@ async fn communication_task(
                 } => {
                     match result {
                         Ok(msg) => {
+                            eprintln!("DEBUG: Received message in main loop: {:?}", msg);
                             process_server_message(msg, &update_sender).await;
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            eprintln!("DEBUG: Connection error in main loop: {:?}", e);
                             // Connection closed
                             connection = None;
                             let _ = update_sender.send(GuiUpdate::Disconnected);
@@ -959,9 +989,15 @@ async fn handle_command(
         GuiCommand::ToggleVideo { enabled } => SignalingMessage::ToggleVideo { enabled },
         GuiCommand::ListServerUsers => SignalingMessage::ListServerUsers,
         GuiCommand::SendMessage { content } => {
-            // Chat messages are fire-and-forget - don't wait for response
-            // The broadcast will update the UI for everyone
-            send_message(stream, &SignalingMessage::SendMessage { content }).await?;
+            // Send chat message
+            let msg = SignalingMessage::SendMessage { content: content.clone() };
+            eprintln!("DEBUG: Sending message to server: {}", content);
+            eprintln!("DEBUG: Message JSON: {}", serde_json::to_string(&msg).unwrap_or_else(|_| "ERROR".to_string()));
+            send_message(stream, &msg).await?;
+            // Read and discard the acknowledgment response
+            // The actual message will come via broadcast to all participants
+            let ack = receive_message(stream).await?;
+            eprintln!("DEBUG: Received acknowledgment: {:?}", ack);
             return Ok(());
         },
         _ => return Ok(()),
@@ -1056,15 +1092,18 @@ async fn process_server_message(
     message: SignalingMessage,
     update_sender: &mpsc::UnboundedSender<GuiUpdate>,
 ) {
+    eprintln!("DEBUG: process_server_message called with: {:?}", message);
     // Handle unsolicited broadcasts from the server (messages, participant joins/leaves, etc.)
     match message {
         SignalingMessage::MessageReceived { sender_id, sender_username, content, timestamp } => {
+            eprintln!("DEBUG: Processing MessageReceived from {} ({}): {}", sender_username, sender_id, content);
             let chat_message = ChatMessage {
-                sender_id,
-                sender_username,
-                content,
+                sender_id: sender_id.clone(),
+                sender_username: sender_username.clone(),
+                content: content.clone(),
                 timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
             };
+            eprintln!("DEBUG: Sending GuiUpdate::ChatMessageReceived");
             let _ = update_sender.send(GuiUpdate::ChatMessageReceived { message: chat_message });
         },
         SignalingMessage::ParticipantJoined { participant_id, username } => {
