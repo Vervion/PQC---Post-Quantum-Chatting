@@ -607,18 +607,7 @@ impl eframe::App for EnhancedPqcChatApp {
                     if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
                         let content = self.message_input.trim().to_string();
 
-                        // Optimistic update: append own message immediately
-                        self.chat_messages.push(ChatMessage {
-                            sender_id: "self".to_string(),
-                            sender_username: self.username.clone(),
-                            content: content.clone(),
-                            timestamp: std::time::SystemTime::now(),
-                        });
-
-                        if self.chat_messages.len() > 100 {
-                            self.chat_messages.remove(0);
-                        }
-
+                        // Send message - the server broadcast will update UI for everyone
                         self.send_command(GuiCommand::SendMessage { content });
                         self.message_input.clear();
                         response.request_focus();
@@ -969,7 +958,12 @@ async fn handle_command(
         GuiCommand::ToggleAudio { enabled } => SignalingMessage::ToggleAudio { enabled },
         GuiCommand::ToggleVideo { enabled } => SignalingMessage::ToggleVideo { enabled },
         GuiCommand::ListServerUsers => SignalingMessage::ListServerUsers,
-        GuiCommand::SendMessage { content } => SignalingMessage::SendMessage { content },
+        GuiCommand::SendMessage { content } => {
+            // Chat messages are fire-and-forget - don't wait for response
+            // The broadcast will update the UI for everyone
+            send_message(stream, &SignalingMessage::SendMessage { content }).await?;
+            return Ok(());
+        },
         _ => return Ok(()),
     };
     
