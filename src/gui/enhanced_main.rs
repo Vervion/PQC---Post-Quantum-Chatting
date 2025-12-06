@@ -256,16 +256,29 @@ impl EnhancedPqcChatApp {
                 GuiUpdate::ParticipantJoined { participant } => {
                     eprintln!("DEBUG: ParticipantJoined - {} ({})", participant.username, participant.id);
                     self.room_participants.push(participant.clone());
+                    
+                    // Update current room participant count
+                    if let Some(ref mut room) = self.current_room {
+                        room.participants = self.room_participants.len() as u32;
+                    }
+                    
                     self.add_status_message(format!("🟢 {} joined the room (total: {})", participant.username, self.room_participants.len()));
                 },
                 GuiUpdate::ParticipantLeft { participant_id } => {
-                    self.room_participants.retain(|p| p.id != participant_id);
-                    // Find the username for the status message
+                    // Find the username before removing for the status message
                     let username = self.room_participants.iter()
                         .find(|p| p.id == participant_id)
                         .map(|p| p.username.clone())
                         .unwrap_or_else(|| "User".to_string());
-                    self.add_status_message(format!("🔴 {} left the room", username));
+                    
+                    self.room_participants.retain(|p| p.id != participant_id);
+                    
+                    // Update current room participant count
+                    if let Some(ref mut room) = self.current_room {
+                        room.participants = self.room_participants.len() as u32;
+                    }
+                    
+                    self.add_status_message(format!("🔴 {} left the room (total: {})", username, self.room_participants.len()));
                 },
                 GuiUpdate::ParticipantAudioToggled { participant_id, enabled } => {
                     if let Some(participant) = self.room_participants.iter_mut().find(|p| p.id == participant_id) {
