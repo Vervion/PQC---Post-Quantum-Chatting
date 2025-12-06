@@ -525,14 +525,18 @@ impl eframe::App for EnhancedPqcChatApp {
                 .default_width(250.0)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.heading("👥 Connected Users (Server-wide)");
+                        ui.heading("👥 Connected Users");
                         if ui.button("🔄").on_hover_text("Refresh user list").clicked() {
                             self.send_command(GuiCommand::ListServerUsers);
                         }
                     });
                     ui.separator();
                     
-                    ui.label("All users connected to the server:");
+                    if self.current_room.is_some() {
+                        ui.label("Room Participants:");
+                    } else {
+                        ui.label("All users connected to the server:");
+                    }
                     ui.label(format!("Currently showing: {} users", self.connected_users.len()));
                     ui.separator();
                     
@@ -541,8 +545,12 @@ impl eframe::App for EnhancedPqcChatApp {
                         .show(ui, |ui| {
                             if self.connected_users.is_empty() {
                                 ui.vertical_centered(|ui| {
-                                    ui.label("📭 No users found");
-                                    ui.small("Click refresh or check server connection");
+                                    if self.current_room.is_none() {
+                                        ui.label("📭 No users found");
+                                        ui.small("(Server-wide user list may not be supported)");
+                                    } else {
+                                        ui.label("📭 No participants yet");
+                                    }
                                 });
                             } else {
                                 for (user_id, user) in &self.connected_users {
@@ -967,10 +975,17 @@ async fn handle_command(
             let _ = update_sender.send(GuiUpdate::ChatMessageReceived { message: chat_message });
         },
         SignalingMessage::Error { message } => {
-            let _ = update_sender.send(GuiUpdate::StatusMessage { message });
+            // Suppress "Invalid message format" errors silently (older server versions may not support ListServerUsers)
+            if !message.contains("Invalid message format") {
+                let _ = update_sender.send(GuiUpdate::StatusMessage { 
+                    message: format!("❌ Server Error: {}", message) 
+                });
+            }
         },
-        _ => {
-            // Handle other message types
+        unexpected => {
+            // Log unexpected message types for debugging
+            let msg_type = format!("{:?}", unexpected);
+            eprintln!("Unexpected response from server: {}", msg_type);
         }
     }
     
