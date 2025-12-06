@@ -436,6 +436,54 @@ async fn handle_message(
             }
         }
 
+        SignalingMessage::SendMessage { content } => {
+            // Get sender username
+            let sender_username = client_state.read().username.clone().unwrap_or_else(|| "Unknown".to_string());
+            
+            // Find which room the sender is in
+            if let Some(room) = state.room_manager.get_participant_room(participant_id) {
+                let room_id = room.id.clone();
+                
+                // Create chat message
+                let chat_message = SignalingMessage::MessageReceived {
+                    sender_id: participant_id.to_string(),
+                    sender_username: sender_username.clone(),
+                    content: content.clone(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                };
+                
+                // Broadcast to all participants in the room (including sender)
+                broadcast_to_room_all(&state, &room_id, chat_message).await;
+                
+                info!("Chat message from {} in room {}: {}", sender_username, room.name, content);
+            }
+            
+            // Return success response
+            SignalingMessage::Error { message: "Message sent".to_string() }
+        }
+
+        SignalingMessage::AudioData { data } => {
+            // Find which room the sender is in and forward audio to all participants
+            if let Some(room) = state.room_manager.get_participant_room(participant_id) {
+                let room_id = room.id.clone();
+                
+                // Create audio message
+                let audio_message = SignalingMessage::AudioDataReceived {
+                    sender_id: participant_id.to_string(),
+                    data,
+                };
+                
+                // Broadcast to all other participants in the room (excluding sender)
+                broadcast_to_room(&state, &room_id, participant_id, audio_message).await;
+            }
+            
+            // No response needed for audio data
+            SignalingMessage::Error { message: "Audio forwarded".to_string() }
+        }
+
         _ => SignalingMessage::Error {
             message: "Unsupported message type".to_string(),
         },
@@ -483,6 +531,34 @@ async fn broadcast_to_room(
                 } else {
                     info!("Client {} not found in clients map", participant_id);
                 }
+            }
+        }
+    } else {
+        info!("Room {} not found for broadcast", room_id);
+    }
+}
+
+/// Broadcast a message to all participants in a room including the sender
+async fn broadcast_to_room_all(
+    state: &Arc<ServerState>, 
+    room_id: &str, 
+    message: SignalingMessage
+) {
+    if let Some(room) = state.room_manager.get_room(room_id) {
+        let participant_ids = room.get_participant_ids();
+        let clients = state.clients.read();
+        
+        info!("Broadcasting {:?} to all in room {}", message, room_id);
+        info!("Participants in room: {:?}", participant_ids);
+        
+        for participant_id in participant_ids {
+            if let Some(client_state) = clients.get(&participant_id) {
+                info!("Sending broadcast to participant {}", participant_id);
+                if let Err(e) = client_state.read().message_tx.send(message.clone()) {
+                    error!("Failed to send broadcast to {}: {}", participant_id, e);
+                }
+            } else {
+                info!("Client {} not found in clients map", participant_id);
             }
         }
     } else {

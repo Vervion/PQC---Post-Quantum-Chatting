@@ -42,6 +42,16 @@ pub enum SignalingMessage {
         candidate: String,
     },
     
+    // Chat messages
+    SendMessage {
+        content: String,
+    },
+    
+    // Audio streaming
+    AudioData {
+        data: Vec<u8>,
+    },
+    
     // Key exchange messages
     KeyExchangeInit {
         public_key: Vec<u8>,
@@ -94,6 +104,21 @@ pub enum SignalingMessage {
         participant_id: String,
         enabled: bool,
     },
+    
+    // Chat messages
+    MessageReceived {
+        sender_id: String,
+        sender_username: String,
+        content: String,
+        timestamp: u64,
+    },
+    
+    // Audio streaming
+    AudioDataReceived {
+        sender_id: String,
+        data: Vec<u8>,
+    },
+    
     Error {
         message: String,
     },

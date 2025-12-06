@@ -18,7 +18,31 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "gui")]
 use pqc_chat::crypto::kyber::KyberKeyExchange;
 #[cfg(feature = "gui")]
-use pqc_chat::protocol::{ParticipantInfo, RoomInfo, ServerUserInfo, SignalingMessage};
+use pqc_chat::protocol::{ParticipantInfo, RoomInfo, SignalingMessage};
+
+// Helper function for formatting timestamps
+fn format_time(time: std::time::SystemTime) -> String {
+    if let Ok(duration) = time.duration_since(std::time::UNIX_EPOCH) {
+        let secs = duration.as_secs();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let diff = now.saturating_sub(secs);
+        if diff < 60 {
+            "now".to_string()
+        } else if diff < 3600 {
+            format!("{}m ago", diff / 60)
+        } else if diff < 86400 {
+            format!("{}h ago", diff / 3600)
+        } else {
+            format!("{}d ago", diff / 86400)
+        }
+    } else {
+        "unknown".to_string()
+    }
+}
 
 
 #[cfg(feature = "gui")]
@@ -43,6 +67,15 @@ fn main() -> Result<(), eframe::Error> {
 #[cfg(not(feature = "gui"))]
 fn main() {
     eprintln!("GUI feature not enabled. Build with: cargo build --features gui");
+}
+
+#[cfg(feature = "gui")]
+#[derive(Debug, Clone)]
+struct ChatMessage {
+    sender_id: String,
+    sender_username: String,
+    content: String,
+    timestamp: std::time::SystemTime,
 }
 
 #[cfg(feature = "gui")]
@@ -90,6 +123,10 @@ struct EnhancedPqcChatApp {
     audio_enabled: bool,
     video_enabled: bool,
 
+    // Chat state
+    chat_messages: Vec<ChatMessage>,
+    message_input: String,
+    
     // UI state
     show_users_panel: bool,
     show_rooms_panel: bool,
@@ -114,6 +151,8 @@ enum GuiCommand {
     ToggleVideo { enabled: bool },
     // Server-wide user management
     ListServerUsers,
+    // Chat functionality
+    SendMessage { content: String },
 }
 
 #[cfg(feature = "gui")]
@@ -133,6 +172,8 @@ enum GuiUpdate {
     ServerUserConnected { user: ConnectedUser },
     ServerUserDisconnected { user_id: String },
     ServerUserList { users: Vec<ConnectedUser> },
+    // Chat functionality
+    ChatMessageReceived { message: ChatMessage },
     StatusMessage { message: String },
 }
 
@@ -168,6 +209,8 @@ impl EnhancedPqcChatApp {
             room_participants: Vec::new(),
             connected_users: HashMap::new(),
             user_list_scroll: 0.0,
+            chat_messages: Vec::new(),
+            message_input: String::new(),
             audio_enabled: true,
             video_enabled: true,
             show_users_panel: true,
@@ -309,6 +352,13 @@ impl EnhancedPqcChatApp {
                     self.connected_users.clear();
                     for user in users {
                         self.connected_users.insert(user.id.clone(), user);
+                    }
+                },
+                GuiUpdate::ChatMessageReceived { message } => {
+                    self.chat_messages.push(message);
+                    // Keep only last 100 messages
+                    if self.chat_messages.len() > 100 {
+                        self.chat_messages.remove(0);
                     }
                 },
                 GuiUpdate::StatusMessage { message } => {
@@ -538,89 +588,151 @@ impl eframe::App for EnhancedPqcChatApp {
                 });
         }
 
-        // Central panel - Room participants and controls
+        // Central panel - Chat and room controls
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.is_connected {
-                if let Some(room) = &self.current_room {
-                    ui.heading(format!("🏠 Room: {}", room.name));
-                    ui.separator();
-                    
-                    // Media controls
+                if let Some(room) = self.current_room.clone() {
+                    // Room header with controls
                     ui.horizontal(|ui| {
+                        ui.heading(format!("🏠 {}", room.name));
+                        ui.separator();
+                        
+                        // Media controls
                         if self.audio_enabled {
-                            if ui.button("🎤 Audio ON").clicked() {
+                            if ui.button("🎤").on_hover_text("Turn audio OFF").clicked() {
                                 self.audio_enabled = false;
                                 self.send_command(GuiCommand::ToggleAudio { enabled: false });
                             }
                         } else {
-                            if ui.button("🔇 Audio OFF").clicked() {
+                            if ui.button("🔇").on_hover_text("Turn audio ON").clicked() {
                                 self.audio_enabled = true;
                                 self.send_command(GuiCommand::ToggleAudio { enabled: true });
                             }
-                        };
+                        }
                         
                         if self.video_enabled {
-                            if ui.button("📹 Video ON").clicked() {
+                            if ui.button("📹").on_hover_text("Turn video OFF").clicked() {
                                 self.video_enabled = false;
                                 self.send_command(GuiCommand::ToggleVideo { enabled: false });
                             }
                         } else {
-                            if ui.button("📺 Video OFF").clicked() {
+                            if ui.button("📺").on_hover_text("Turn video ON").clicked() {
                                 self.video_enabled = true;
                                 self.send_command(GuiCommand::ToggleVideo { enabled: true });
                             }
-                        };
+                        }
+                        
+                        ui.separator();
+                        ui.label(format!("👥 {} participants", self.room_participants.len()));
                     });
                     
                     ui.separator();
                     
-                    // Room participants
-                    ui.heading("👥 Room Participants");
-                    
-                    egui::ScrollArea::vertical()
-                        .max_height(300.0)
-                        .show(ui, |ui| {
-                            egui::Grid::new("participants_grid")
-                                .num_columns(4)
-                                .striped(true)
+                    // Main content area - split between chat and participants
+                    ui.horizontal(|ui| {
+                        // Chat area (70% width)
+                        ui.vertical(|ui| {
+                            ui.set_min_width(ui.available_width() * 0.7);
+                            
+                            ui.heading("💬 Chat");
+                            
+                            // Chat messages area
+                            let chat_height = ui.available_height() - 60.0; // Reserve space for input
+                            egui::ScrollArea::vertical()
+                                .max_height(chat_height)
+                                .stick_to_bottom(true)
                                 .show(ui, |ui| {
-                                    ui.heading("User");
-                                    ui.heading("Audio");
-                                    ui.heading("Video");
-                                    ui.heading("Status");
-                                    ui.end_row();
-                                    
+                                    if self.chat_messages.is_empty() {
+                                        ui.vertical_centered(|ui| {
+                                            ui.label("🗨️ No messages yet");
+                                            ui.small("Start the conversation!");
+                                        });
+                                    } else {
+                                        for msg in &self.chat_messages {
+                                            ui.group(|ui| {
+                                                ui.horizontal(|ui| {
+                                                    if msg.sender_username == self.username {
+                                                        ui.strong("You");
+                                                    } else {
+                                                        ui.label(&msg.sender_username);
+                                                    }
+                                                    ui.small(format_time(msg.timestamp));
+                                                });
+                                                ui.label(&msg.content);
+                                            });
+                                            ui.separator();
+                                        }
+                                    }
+                                });
+                            
+                            ui.separator();
+                            
+                            // Message input
+                            ui.horizontal(|ui| {
+                                let response = ui.text_edit_singleline(&mut self.message_input);
+                                
+                                let send_clicked = ui.button("📤 Send").clicked();
+                                let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                
+                                if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
+                                    let content = self.message_input.trim().to_string();
+                                    self.send_command(GuiCommand::SendMessage { content });
+                                    self.message_input.clear();
+                                    response.request_focus();
+                                }
+                            });
+                        });
+                        
+                        ui.separator();
+                        
+                        // Participants area (30% width)
+                        ui.vertical(|ui| {
+                            ui.heading("👥 Participants");
+                            
+                            egui::ScrollArea::vertical()
+                                .show(ui, |ui| {
                                     for participant in &self.room_participants {
-                                        ui.label(&participant.username);
-                                        ui.label(if participant.audio_enabled { "🎤" } else { "🔇" });
-                                        ui.label(if participant.video_enabled { "📹" } else { "📺" });
-                                        ui.label("🟢 Online");
-                                        ui.end_row();
+                                        ui.horizontal(|ui| {
+                                            let audio_icon = if participant.audio_enabled { "🎤" } else { "🔇" };
+                                            let video_icon = if participant.video_enabled { "📹" } else { "📺" };
+                                            
+                                            ui.label(format!("{} {}", audio_icon, video_icon));
+                                            
+                                            if participant.username == self.username {
+                                                ui.strong(&participant.username);
+                                                ui.small("(You)");
+                                            } else {
+                                                ui.label(&participant.username);
+                                            }
+                                        });
+                                        ui.separator();
                                     }
                                 });
                         });
+                    });
                 } else {
                     ui.vertical_centered(|ui| {
                         ui.heading("Welcome to PQC Chat!");
                         ui.label("🔐 Post-Quantum Secure Video Chat");
                         ui.separator();
                         ui.label("Select a room from the left panel or create a new one to start chatting.");
+                        ui.separator();
+                        
+                        // Status messages in lobby
+                        ui.heading("📨 Recent Activity");
+                        egui::ScrollArea::vertical()
+                            .max_height(200.0)
+                            .show(ui, |ui| {
+                                if self.status_messages.is_empty() {
+                                    ui.label("No recent activity");
+                                } else {
+                                    for (message, _timestamp) in self.status_messages.iter().rev().take(10) {
+                                        ui.label(message);
+                                    }
+                                }
+                            });
                     });
                 }
-                
-                ui.separator();
-                
-                // Status messages
-                ui.heading("📨 Status Messages");
-                egui::ScrollArea::vertical()
-                    .max_height(150.0)
-                    .auto_shrink([false; 2])
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for (message, _timestamp) in &self.status_messages {
-                            ui.label(message);
-                        }
-                    });
             } else {
                 ui.vertical_centered(|ui| {
                     ui.heading("🔐 PQC Chat");
@@ -764,6 +876,7 @@ async fn handle_command(
         GuiCommand::ToggleAudio { enabled } => SignalingMessage::ToggleAudio { enabled },
         GuiCommand::ToggleVideo { enabled } => SignalingMessage::ToggleVideo { enabled },
         GuiCommand::ListServerUsers => SignalingMessage::ListServerUsers,
+        GuiCommand::SendMessage { content } => SignalingMessage::SendMessage { content },
         _ => return Ok(()),
     };
     
@@ -830,6 +943,15 @@ async fn handle_command(
                 }
             }).collect();
             let _ = update_sender.send(GuiUpdate::ServerUserList { users: connected_users });
+        },
+        SignalingMessage::MessageReceived { sender_id, sender_username, content, timestamp } => {
+            let chat_message = ChatMessage {
+                sender_id,
+                sender_username,
+                content,
+                timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
+            };
+            let _ = update_sender.send(GuiUpdate::ChatMessageReceived { message: chat_message });
         },
         SignalingMessage::Error { message } => {
             let _ = update_sender.send(GuiUpdate::StatusMessage { message });

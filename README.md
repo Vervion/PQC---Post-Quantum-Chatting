@@ -239,13 +239,162 @@ The client and server communicate via JSON messages over TLS:
 - [x] **User Status Indicators** - Audio/video status with emoji indicators
 - [x] **Multi-panel Interface** - Dedicated panels for users, rooms, and controls
 - [ ] Use Kyber shared secret for additional media encryption
-- [ ] Real DTLS-SRTP implementation
-- [ ] Actual audio/video capture integration
+- [x] **Text Chat** - Real-time text messaging in rooms with timestamp support
+- [ ] **Audio Communication Implementation** - See [Audio Implementation Guide](#audio-implementation-guide) below
+- [ ] Real DTLS-SRTP implementation  
 - [ ] Audio/video encoding (Opus, VP8/VP9)
 - [ ] ICE/STUN/TURN support for NAT traversal
 - [ ] End-to-end encryption for media using Kyber-derived keys
 - [ ] Screen sharing
-- [ ] Text chat
+
+## Audio Implementation Guide
+
+The audio communication infrastructure is in place but requires actual audio capture and playback implementation. Here's how to add real audio functionality:
+
+### Recommended Approach: Using `cpal`
+
+`cpal` (Cross-Platform Audio Library) is ideal for low-level audio control:
+
+```toml
+# Add to Cargo.toml
+[dependencies]
+cpal = "0.15"
+ringbuf = "0.3"  # For audio buffering
+```
+
+#### Audio Capture Implementation
+
+```rust
+// In src/audio/capture.rs
+use cpal::{Device, Stream, StreamConfig};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+pub struct AudioCapture {
+    stream: Stream,
+    // Channel for sending audio data to GUI
+    audio_sender: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl AudioCapture {
+    pub fn new(audio_sender: mpsc::UnboundedSender<Vec<u8>>) -> Result<Self, Box<dyn std::error::Error>> {
+        let host = cpal::default_host();
+        let device = host.default_input_device().ok_or("No input device")?;
+        let config = device.default_input_config()?;
+        
+        let stream = device.build_input_stream(
+            &config.into(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                // Convert f32 samples to bytes and send
+                let bytes: Vec<u8> = data.iter()
+                    .flat_map(|&sample| (sample * i16::MAX as f32) as i16 as u16.to_le_bytes())
+                    .collect();
+                let _ = audio_sender.send(bytes);
+            },
+            |err| eprintln!("Audio capture error: {}", err),
+            None,
+        )?;
+        
+        stream.play()?;
+        Ok(AudioCapture { stream, audio_sender })
+    }
+}
+```
+
+#### Audio Playback Implementation
+
+```rust
+// In src/audio/playback.rs
+use ringbuf::{HeapRb, HeapProducer, HeapConsumer};
+
+pub struct AudioPlayback {
+    stream: Stream,
+    producer: HeapProducer<f32>,
+}
+
+impl AudioPlayback {
+    pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let ring_buffer = HeapRb::<f32>::new(1024 * 16); // 16KB buffer
+        let (producer, consumer) = ring_buffer.split();
+        
+        let host = cpal::default_host();
+        let device = host.default_output_device().ok_or("No output device")?;
+        let config = device.default_output_config()?;
+        
+        let stream = device.build_output_stream(
+            &config.into(),
+            move |output: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                for sample in output.iter_mut() {
+                    *sample = consumer.pop().unwrap_or(0.0);
+                }
+            },
+            |err| eprintln!("Audio playback error: {}", err),
+            None,
+        )?;
+        
+        stream.play()?;
+        Ok(AudioPlayback { stream, producer })
+    }
+    
+    pub fn play_audio(&mut self, audio_data: &[u8]) {
+        // Convert bytes back to f32 samples
+        for chunk in audio_data.chunks_exact(2) {
+            let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / i16::MAX as f32;
+            let _ = self.producer.push(sample);
+        }
+    }
+}
+```
+
+### Alternative: Using `rodio`
+
+`rodio` is better for higher-level audio playback:
+
+```toml
+[dependencies]
+rodio = "0.17"
+cpal = "0.15"  # Still needed for capture
+```
+
+```rust
+// For audio playback with rodio
+use rodio::{Decoder, OutputStream, Sink};
+
+pub fn play_received_audio(audio_data: Vec<u8>) {
+    let (_stream, stream_handle) = OutputStream::try_default().unwrap();
+    let sink = Sink::try_new(&stream_handle).unwrap();
+    
+    // Convert raw audio data to a format rodio can play
+    let cursor = std::io::Cursor::new(audio_data);
+    let source = Decoder::new(cursor).unwrap();
+    sink.append(source);
+    sink.sleep_until_end();
+}
+```
+
+### Integration Points
+
+1. **In GuiCommand enum**: Add `StartAudioCapture` and `StopAudioCapture`
+2. **In communication_task**: Handle incoming `AudioDataReceived` messages and send to playback
+3. **In GUI audio toggle**: Start/stop audio capture based on button state
+4. **In server**: Ensure audio forwarding is working (already implemented)
+
+### Audio Quality Settings
+
+```rust
+// Recommended settings for voice chat
+const SAMPLE_RATE: u32 = 16000;  // 16kHz for voice
+const CHANNELS: u16 = 1;         // Mono
+const BITS_PER_SAMPLE: u16 = 16; // 16-bit
+```
+
+### Performance Considerations
+
+- Use `ringbuf` for lock-free audio buffering
+- Implement audio compression (Opus codec) for network efficiency
+- Add echo cancellation and noise reduction if needed
+- Buffer audio data to handle network jitter
+
+The protocol infrastructure (`AudioData` and `AudioDataReceived` messages) is already implemented and working. Adding the above audio capture/playback code will complete the audio communication system.
 
 ## Security
 
