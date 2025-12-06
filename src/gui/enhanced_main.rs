@@ -637,7 +637,7 @@ impl eframe::App for EnhancedPqcChatApp {
                             ui.heading("💬 Chat");
                             
                             // Chat messages area
-                            let chat_height = ui.available_height() - 60.0; // Reserve space for input
+                            let chat_height = ui.available_height() - 80.0; // Reserve space for input
                             egui::ScrollArea::vertical()
                                 .max_height(chat_height)
                                 .stick_to_bottom(true)
@@ -665,9 +665,9 @@ impl eframe::App for EnhancedPqcChatApp {
                                     }
                                 });
                             
-                            ui.separator();
+                            ui.add_space(10.0); // Spacing before input bar
                             
-                            // Message input
+                            // Message input - now positioned lower
                             ui.horizontal(|ui| {
                                 let response = ui.text_edit_singleline(&mut self.message_input);
                                 
@@ -685,27 +685,32 @@ impl eframe::App for EnhancedPqcChatApp {
                         
                         ui.separator();
                         
-                        // Participants area (30% width)
+                        // Participants area (30% width) - FIXED HORIZONTAL LAYOUT
                         ui.vertical(|ui| {
                             ui.heading("👥 Participants");
                             
                             egui::ScrollArea::vertical()
+                                .auto_shrink([false; 2])
                                 .show(ui, |ui| {
-                                    for participant in &self.room_participants {
-                                        ui.horizontal(|ui| {
-                                            let audio_icon = if participant.audio_enabled { "🎤" } else { "🔇" };
-                                            let video_icon = if participant.video_enabled { "📹" } else { "📺" };
-                                            
-                                            ui.label(format!("{} {}", audio_icon, video_icon));
-                                            
-                                            if participant.username == self.username {
-                                                ui.strong(&participant.username);
-                                                ui.small("(You)");
-                                            } else {
-                                                ui.label(&participant.username);
-                                            }
-                                        });
-                                        ui.separator();
+                                    if self.room_participants.is_empty() {
+                                        ui.label("No participants yet");
+                                    } else {
+                                        for participant in &self.room_participants {
+                                            ui.horizontal(|ui| {
+                                                let audio_icon = if participant.audio_enabled { "🎤" } else { "🔇" };
+                                                let video_icon = if participant.video_enabled { "📹" } else { "📺" };
+                                                
+                                                ui.label(format!("{} {}", audio_icon, video_icon));
+                                                
+                                                if participant.username == self.username {
+                                                    ui.strong(&participant.username);
+                                                    ui.small("(You)");
+                                                } else {
+                                                    ui.label(&participant.username);
+                                                }
+                                            });
+                                            ui.separator();
+                                        }
                                     }
                                 });
                         });
