@@ -28,7 +28,7 @@ fn format_time(time: std::time::SystemTime) -> String {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
         let diff = now.saturating_sub(secs);
         if diff < 60 {
             "now".to_string()
@@ -130,6 +130,7 @@ struct EnhancedPqcChatApp {
     // UI state
     show_users_panel: bool,
     show_rooms_panel: bool,
+    users_window_open: bool,
     status_messages: Vec<(String, std::time::SystemTime)>,
     
     // Communication
@@ -215,6 +216,7 @@ impl EnhancedPqcChatApp {
             video_enabled: true,
             show_users_panel: true,
             show_rooms_panel: true,
+            users_window_open: true,
             status_messages: Vec::new(),
             runtime: Some(runtime),
             command_sender: Some(command_sender),
@@ -400,7 +402,11 @@ impl eframe::App for EnhancedPqcChatApp {
                 ui.label(&self.connection_status);
                 ui.separator();
                 
-                ui.checkbox(&mut self.show_users_panel, "👥 Users");
+                let users_resp = ui.checkbox(&mut self.show_users_panel, "👥 Users");
+                // Keep the floating window open state in sync with the checkbox
+                if users_resp.changed() {
+                    self.users_window_open = self.show_users_panel;
+                }
                 ui.checkbox(&mut self.show_rooms_panel, "🏠 Rooms");
                 
                 if self.is_connected {
@@ -589,6 +595,37 @@ impl eframe::App for EnhancedPqcChatApp {
                 });
         }
 
+        // Chat input bottom panel (global) - anchor the input at absolute bottom
+        egui::TopBottomPanel::bottom("chat_input_panel")
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let response = ui.text_edit_singleline(&mut self.message_input);
+
+                    let send_clicked = ui.button("📤 Send").clicked();
+                    let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                    if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
+                        let content = self.message_input.trim().to_string();
+
+                        // Optimistic update: append own message immediately
+                        self.chat_messages.push(ChatMessage {
+                            sender_id: "self".to_string(),
+                            sender_username: self.username.clone(),
+                            content: content.clone(),
+                            timestamp: std::time::SystemTime::now(),
+                        });
+
+                        if self.chat_messages.len() > 100 {
+                            self.chat_messages.remove(0);
+                        }
+
+                        self.send_command(GuiCommand::SendMessage { content });
+                        self.message_input.clear();
+                        response.request_focus();
+                    }
+                });
+            });
+
         // Central panel - Chat and room controls
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.is_connected {
@@ -628,41 +665,20 @@ impl eframe::App for EnhancedPqcChatApp {
                     });
                     
                     ui.separator();
-                    
-                    // Main content area - split between chat and participants
+
+                    // Main content area - chat and participants side-by-side
                     ui.horizontal(|ui| {
-                        // Chat area (70% width)
-                        ui.set_min_width(ui.available_width() * 0.7);
+                        // Chat area (left, 70% width)
+                        ui.vertical(|ui| {
+                            ui.set_min_width(ui.available_width() * 0.7);
 
-                        // Use a bottom-up layout so the message input stays anchored to the bottom
-                        // and the chat feed occupies the space above it.
-                        let available = ui.available_size();
-                        ui.allocate_ui_with_layout(available, egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                            // Message input (anchored to bottom)
-                            ui.horizontal(|ui| {
-                                let response = ui.text_edit_singleline(&mut self.message_input);
-
-                                let send_clicked = ui.button("📤 Send").clicked();
-                                let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-
-                                if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
-                                    let content = self.message_input.trim().to_string();
-                                    self.send_command(GuiCommand::SendMessage { content });
-                                    self.message_input.clear();
-                                    response.request_focus();
-                                }
-                            });
-
-                            ui.separator();
-
-                            // Chat messages area fills the remaining space above the input
-                            let chat_height = ui.available_height();
+                            // Constrain the scroll area to the available height so it becomes scrollable
+                            let chat_max_h = ui.available_height();
                             egui::ScrollArea::vertical()
-                                .max_height(chat_height)
+                                .id_source("chat_scroll_area")
+                                .max_height(chat_max_h)
                                 .stick_to_bottom(true)
                                 .show(ui, |ui| {
-                                    ui.heading("💬 Chat");
-
                                     if self.chat_messages.is_empty() {
                                         ui.vertical_centered(|ui| {
                                             ui.label("🗨️ No messages yet");
@@ -689,7 +705,7 @@ impl eframe::App for EnhancedPqcChatApp {
 
                         ui.separator();
 
-                        // Participants area (30% width)
+                        // Participants area (right, 30% width)
                         ui.vertical(|ui| {
                             ui.heading("👥 Participants");
 
@@ -714,6 +730,7 @@ impl eframe::App for EnhancedPqcChatApp {
                                 });
                         });
                     });
+
                 } else {
                     ui.vertical_centered(|ui| {
                         ui.heading("Welcome to PQC Chat!");
@@ -746,6 +763,81 @@ impl eframe::App for EnhancedPqcChatApp {
                 });
             }
         });
+
+        // Floating users window when in a room (controlled by the Users checkbox)
+        if self.show_users_panel && self.current_room.is_some() && self.users_window_open {
+            let mut users_open = self.users_window_open;
+            egui::Window::new("👥 Connected Users (Server-wide)")
+                .open(&mut users_open)
+                .resizable(true)
+                .default_width(320.0)
+                .default_height(400.0)
+                .collapsible(true)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("👥 Connected Users (Server-wide)");
+                        if ui.button("🔄").on_hover_text("Refresh user list").clicked() {
+                            self.send_command(GuiCommand::ListServerUsers);
+                        }
+                    });
+                    ui.separator();
+
+                    ui.label("All users connected to the server:");
+                    ui.label(format!("Currently showing: {} users", self.connected_users.len()));
+                    ui.separator();
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            if self.connected_users.is_empty() {
+                                ui.vertical_centered(|ui| {
+                                    ui.label("📭 No users found");
+                                    ui.small("Click refresh or check server connection");
+                                });
+                            } else {
+                                for (user_id, user) in &self.connected_users {
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            let audio_icon = if user.audio_enabled { "🎤" } else { "🔇" };
+                                            let video_icon = if user.video_enabled { "📹" } else { "📺" };
+
+                                            ui.label(format!("{} {}", audio_icon, video_icon));
+
+                                            if user.username == self.username {
+                                                ui.strong(&user.username);
+                                                ui.label("(You)");
+                                            } else {
+                                                ui.label(&user.username);
+                                            }
+                                        });
+
+                                        if let Some(room) = &user.in_room {
+                                            ui.label(format!("🏠 In room: {}", room));
+                                        } else {
+                                            ui.label("🏠 In lobby");
+                                        }
+
+                                        if let Ok(duration) = user.connected_at.elapsed() {
+                                            let mins = duration.as_secs() / 60;
+                                            if mins > 0 {
+                                                ui.label(format!("⏱️ Online {}m", mins));
+                                            } else {
+                                                ui.label("⏱️ Just joined");
+                                            }
+                                        } else {
+                                            ui.label("⏱️ Online");
+                                        }
+
+                                        ui.small(format!("ID: {}", user_id));
+                                    });
+                                    ui.separator();
+                                }
+                            }
+                        });
+                });
+            // commit any user-closed change back into the app state
+            self.users_window_open = users_open;
+        }
     }
 }
 

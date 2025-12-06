@@ -24,7 +24,7 @@ This guide provides complete instructions for setting up PQC Chat across 3 Raspb
 │ pqc-server      │    │ pqc-client1     │◄──►│ pqc-client2     │
 │                 │    │                 │    │                 │
 │ Runs:           │    │ Runs:           │    │ Runs:           │
-│ - pqc-server    │    │ - pqc-gui       │    │ - pqc-gui       │
+│ - pqc-server    │    │ - pqc-enhanced-gui       │    │ - pqc-enhanced-gui       │
 │ - Signaling     │    │ - Audio/Video   │    │ - Audio/Video   │
 │ - Certificate   │    │   capture       │    │   capture       │
 │   management    │    │                 │    │                 │
@@ -130,11 +130,11 @@ sudo journalctl -u pqc-chat-server -f
 On each client Pi:
 
 ```bash
-# Start the GUI application
-/opt/pqc-chat/bin/pqc-gui
+# Start the GUI application (installed by the deploy script)
+/opt/pqc-chat/bin/pqc-enhanced-gui
 
-# Or run from the project directory
-./target/release/pqc-gui
+# Or run from the project directory (developer build)
+./target/release/pqc-enhanced-gui
 ```
 
 ## Configuration Files
@@ -185,7 +185,7 @@ sudo netstat -tlnp | grep -E ":(8443|10000|10001)"
 
 ```bash
 # Run client with debug output
-RUST_LOG=debug /opt/pqc-chat/bin/pqc-gui
+RUST_LOG=debug /opt/pqc-chat/bin/pqc-enhanced-gui
 
 # Check client configuration
 cat /etc/pqc-chat/client.toml
