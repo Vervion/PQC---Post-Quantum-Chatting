@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(feature = "gui")]
 use pqc_chat::crypto::kyber::KyberKeyExchange;
 #[cfg(feature = "gui")]
-use pqc_chat::protocol::{ParticipantInfo, RoomInfo, SignalingMessage};
+use pqc_chat::protocol::{ParticipantInfo, RoomInfo, ServerUserInfo, SignalingMessage};
 
 
 #[cfg(feature = "gui")]
@@ -641,21 +641,9 @@ async fn communication_task(
                         current_username = Some(username.clone());
                         let _ = update_sender.send(GuiUpdate::Connected { participant_id: pid.clone() });
                         
-                        // Request initial room list and server users
+                        // Request initial room list
                         if let Some(ref mut conn) = connection {
                             let _ = send_message(conn, &SignalingMessage::ListRooms).await;
-                            // Also request server users list
-                            let users = vec![
-                                ConnectedUser {
-                                    id: pid.clone(),
-                                    username: username.clone(),
-                                    connected_at: std::time::SystemTime::now(),
-                                    in_room: None,
-                                    audio_enabled: true,
-                                    video_enabled: false,
-                                }
-                            ];
-                            let _ = update_sender.send(GuiUpdate::ServerUserList { users });
                         }
                     },
                     Err(e) => {
@@ -762,22 +750,7 @@ async fn handle_command(
         GuiCommand::LeaveRoom => SignalingMessage::LeaveRoom,
         GuiCommand::ToggleAudio { enabled } => SignalingMessage::ToggleAudio { enabled },
         GuiCommand::ToggleVideo { enabled } => SignalingMessage::ToggleVideo { enabled },
-        GuiCommand::ListServerUsers => {
-            // For now, simulate server user list with known participants
-            // In a real implementation, this would be a new SignalingMessage variant
-            let users = vec![
-                ConnectedUser {
-                    id: format!("user_{}", username),
-                    username: username.to_string(),
-                    connected_at: std::time::SystemTime::now(),
-                    in_room: None,
-                    audio_enabled: true,
-                    video_enabled: false,
-                }
-            ];
-            let _ = update_sender.send(GuiUpdate::ServerUserList { users });
-            return Ok(());
-        },
+        GuiCommand::ListServerUsers => SignalingMessage::ListServerUsers,
         _ => return Ok(()),
     };
     
@@ -831,6 +804,19 @@ async fn handle_command(
         SignalingMessage::ParticipantLeft { participant_id } => {
             let _ = update_sender.send(GuiUpdate::ParticipantLeft { participant_id });
             // Note: Don't remove from server users - they may still be connected to server
+        },
+        SignalingMessage::ServerUserList { users } => {
+            let connected_users = users.into_iter().map(|server_user| {
+                ConnectedUser {
+                    id: server_user.id,
+                    username: server_user.username,
+                    connected_at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(server_user.connected_at),
+                    in_room: server_user.current_room,
+                    audio_enabled: server_user.audio_enabled,
+                    video_enabled: server_user.video_enabled,
+                }
+            }).collect();
+            let _ = update_sender.send(GuiUpdate::ServerUserList { users: connected_users });
         },
         SignalingMessage::Error { message } => {
             let _ = update_sender.send(GuiUpdate::StatusMessage { message });

@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use pqc_chat::crypto::kyber::KyberKeyExchange;
 use pqc_chat::media::MediaForwarder;
-use pqc_chat::protocol::{ParticipantInfo, RoomInfo, SignalingMessage};
+use pqc_chat::protocol::{ParticipantInfo, RoomInfo, ServerUserInfo, SignalingMessage};
 use pqc_chat::room::{Participant, RoomManager};
 use pqc_chat::ServerConfig;
 
@@ -294,6 +294,46 @@ async fn handle_message(
                 })
                 .collect();
             SignalingMessage::RoomList { rooms }
+        }
+
+        SignalingMessage::ListServerUsers => {
+            let clients = state.clients.read();
+            let mut users = Vec::new();
+            
+            for (client_id, client_state) in clients.iter() {
+                let client = client_state.read();
+                if let Some(username) = &client.username {
+                    // Get current room for this user
+                    let current_room = state.room_manager.get_participant_room(client_id)
+                        .map(|room| room.name.clone());
+                    
+                    // Get audio/video status from room if they're in one
+                    let (audio_enabled, video_enabled) = if let Some(room) = state.room_manager.get_participant_room(client_id) {
+                        if let Some(participant) = room.get_participant(client_id) {
+                            (participant.audio_enabled, participant.video_enabled)
+                        } else {
+                            (true, false) // Default values
+                        }
+                    } else {
+                        (true, false) // Default values for lobby users
+                    };
+                    
+                    users.push(ServerUserInfo {
+                        id: client_id.clone(),
+                        username: username.clone(),
+                        connected_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        current_room,
+                        audio_enabled,
+                        video_enabled,
+                    });
+                }
+            }
+            
+            info!("Returning {} connected users", users.len());
+            SignalingMessage::ServerUserList { users }
         }
 
         SignalingMessage::CreateRoom {

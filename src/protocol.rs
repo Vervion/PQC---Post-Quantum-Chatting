@@ -13,6 +13,7 @@ pub enum SignalingMessage {
         username: String,
     },
     ListRooms,
+    ListServerUsers,
     CreateRoom {
         name: String,
         max_participants: Option<u32>,
@@ -57,6 +58,9 @@ pub enum SignalingMessage {
     },
     RoomList {
         rooms: Vec<RoomInfo>,
+    },
+    ServerUserList {
+        users: Vec<ServerUserInfo>,
     },
     RoomCreated {
         success: bool,
@@ -110,6 +114,17 @@ pub struct RoomInfo {
 pub struct ParticipantInfo {
     pub id: String,
     pub username: String,
+    pub audio_enabled: bool,
+    pub video_enabled: bool,
+}
+
+/// Information about a server-wide user
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerUserInfo {
+    pub id: String,
+    pub username: String,
+    pub connected_at: u64, // Unix timestamp
+    pub current_room: Option<String>,
     pub audio_enabled: bool,
     pub video_enabled: bool,
 }
