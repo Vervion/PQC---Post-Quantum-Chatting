@@ -955,6 +955,9 @@ async fn handle_command(
     update_sender: &mpsc::UnboundedSender<GuiUpdate>,
     username: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Check if this is a SendMessage command before consuming it
+    let is_send_message = matches!(command, GuiCommand::SendMessage { .. });
+    
     let message = match command {
         GuiCommand::ListRooms => SignalingMessage::ListRooms,
         GuiCommand::CreateRoom { name, max_participants } => SignalingMessage::CreateRoom {
@@ -974,6 +977,14 @@ async fn handle_command(
     };
     
     send_message(stream, &message).await?;
+    
+    // For SendMessage, don't wait for a response - the server will broadcast the message
+    // to all room participants asynchronously
+    if is_send_message {
+        return Ok(());
+    }
+    
+    // For other commands, wait for a response
     let response = receive_message(stream).await?;
     
     // Process response
