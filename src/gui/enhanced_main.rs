@@ -666,69 +666,38 @@ impl eframe::App for EnhancedPqcChatApp {
                     
                     ui.separator();
 
-                    // Main content area - chat and participants side-by-side
-                    ui.horizontal(|ui| {
-                        // Chat area (left, 70% width)
-                        ui.vertical(|ui| {
-                            ui.set_min_width(ui.available_width() * 0.7);
-
-                            // Constrain the scroll area to the available height so it becomes scrollable
-                            let chat_max_h = ui.available_height();
-                            egui::ScrollArea::vertical()
-                                .id_source("chat_scroll_area")
-                                .max_height(chat_max_h)
-                                .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    if self.chat_messages.is_empty() {
-                                        ui.vertical_centered(|ui| {
-                                            ui.label("🗨️ No messages yet");
-                                            ui.small("Start the conversation!");
-                                        });
-                                    } else {
-                                        for msg in &self.chat_messages {
-                                            ui.group(|ui| {
-                                                ui.horizontal(|ui| {
-                                                    if msg.sender_username == self.username {
-                                                        ui.strong("You");
-                                                    } else {
-                                                        ui.label(&msg.sender_username);
-                                                    }
-                                                    ui.small(format_time(msg.timestamp));
-                                                });
-                                                ui.label(&msg.content);
+                    // Chat area - full width, scrollable, extends from header to input bar
+                    ui.vertical(|ui| {
+                        let chat_max_h = ui.available_height();
+                        ui.set_min_height(chat_max_h);
+                        
+                        egui::ScrollArea::vertical()
+                            .id_source("chat_scroll_area")
+                            .max_height(chat_max_h)
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                if self.chat_messages.is_empty() {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label("🗨️ No messages yet");
+                                        ui.small("Start the conversation!");
+                                    });
+                                } else {
+                                    for msg in &self.chat_messages {
+                                        ui.group(|ui| {
+                                            ui.horizontal(|ui| {
+                                                if msg.sender_username == self.username {
+                                                    ui.strong("You");
+                                                } else {
+                                                    ui.label(&msg.sender_username);
+                                                }
+                                                ui.small(format_time(msg.timestamp));
                                             });
-                                            ui.separator();
-                                        }
-                                    }
-                                });
-                        });
-
-                        ui.separator();
-
-                        // Participants area (right, 30% width)
-                        ui.vertical(|ui| {
-                            ui.heading("👥 Participants");
-
-                            egui::ScrollArea::vertical()
-                                .show(ui, |ui| {
-                                    for participant in &self.room_participants {
-                                        ui.horizontal(|ui| {
-                                            let audio_icon = if participant.audio_enabled { "🎤" } else { "🔇" };
-                                            let video_icon = if participant.video_enabled { "📹" } else { "📺" };
-
-                                            ui.label(format!("{} {}", audio_icon, video_icon));
-
-                                            if participant.username == self.username {
-                                                ui.strong(&participant.username);
-                                                ui.small("(You)");
-                                            } else {
-                                                ui.label(&participant.username);
-                                            }
+                                            ui.label(&msg.content);
                                         });
                                         ui.separator();
                                     }
-                                });
-                        });
+                                }
+                            });
                     });
 
                 } else {
