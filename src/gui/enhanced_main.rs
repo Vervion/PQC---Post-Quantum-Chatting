@@ -816,47 +816,75 @@ async fn communication_task(
     update_sender: mpsc::UnboundedSender<GuiUpdate>,
 ) {
     use tokio::net::TcpStream;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
     
-    let mut connection: Option<tokio_rustls::client::TlsStream<TcpStream>> = None;
+    let mut connection: Option<Arc<Mutex<tokio_rustls::client::TlsStream<TcpStream>>>> = None;
     let mut _participant_id: Option<String> = None;
     let mut current_username: Option<String> = None;
     
-    while let Some(command) = command_receiver.recv().await {
-        match command {
-            GuiCommand::Connect { host, port, username } => {
-                match connect_to_server(&host, port, &username, &update_sender).await {
-                    Ok((stream, pid)) => {
-                        connection = Some(stream);
-                        _participant_id = Some(pid.clone());
-                        current_username = Some(username.clone());
-                        let _ = update_sender.send(GuiUpdate::Connected { participant_id: pid.clone() });
-                        
-                        // Request initial room list
-                        if let Some(ref mut conn) = connection {
-                            let _ = send_message(conn, &SignalingMessage::ListRooms).await;
+    loop {
+        if let Some(ref conn_arc) = connection.clone() {
+            // When connected, listen for both commands and incoming messages
+            let conn_arc_cmd = conn_arc.clone();
+            let conn_arc_recv = conn_arc.clone();
+            
+            tokio::select! {
+                Some(command) = command_receiver.recv() => {
+                    let mut conn = conn_arc_cmd.lock().await;
+                    let username = current_username.as_deref().unwrap_or("User");
+                    match command {
+                        GuiCommand::Disconnect => {
+                            connection = None;
+                            _participant_id = None;
+                            current_username = None;
+                            let _ = update_sender.send(GuiUpdate::Disconnected);
+                        },
+                        _ => {
+                            let _ = handle_command(&mut *conn, command, &update_sender, username).await;
                         }
-                    },
-                    Err(e) => {
-                        let _ = update_sender.send(GuiUpdate::ConnectionError { 
-                            error: e.to_string() 
-                        });
                     }
                 }
-            },
-            GuiCommand::Disconnect => {
-                connection = None;
-                _participant_id = None;
-                current_username = None;
-                let _ = update_sender.send(GuiUpdate::Disconnected);
-            },
-            _ if connection.is_some() => {
-                if let Some(ref mut conn) = connection {
-                    let username = current_username.as_deref().unwrap_or("User");
-                    let _ = handle_command(conn, command, &update_sender, username).await;
+                result = async {
+                    let mut conn = conn_arc_recv.lock().await;
+                    receive_message(&mut *conn).await
+                } => {
+                    match result {
+                        Ok(msg) => {
+                            process_server_message(msg, &update_sender).await;
+                        }
+                        Err(_) => {
+                            // Connection closed
+                            connection = None;
+                            let _ = update_sender.send(GuiUpdate::Disconnected);
+                        }
+                    }
                 }
-            },
-            _ => {
-                // Ignore commands when not connected
+            }
+        } else {
+            // Not connected, just wait for connect command
+            if let Some(command) = command_receiver.recv().await {
+                if let GuiCommand::Connect { host, port, username } = command {
+                    match connect_to_server(&host, port, &username, &update_sender).await {
+                        Ok((stream, pid)) => {
+                            connection = Some(Arc::new(Mutex::new(stream)));
+                            _participant_id = Some(pid.clone());
+                            current_username = Some(username.clone());
+                            let _ = update_sender.send(GuiUpdate::Connected { participant_id: pid.clone() });
+                            
+                            // Request initial room list
+                            if let Some(ref conn_arc) = connection {
+                                let mut conn = conn_arc.lock().await;
+                                let _ = send_message(&mut *conn, &SignalingMessage::ListRooms).await;
+                            }
+                        },
+                        Err(e) => {
+                            let _ = update_sender.send(GuiUpdate::ConnectionError { 
+                                error: e.to_string() 
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -1027,6 +1055,40 @@ async fn handle_command(
     }
     
     Ok(())
+}
+
+#[cfg(feature = "gui")]
+async fn process_server_message(
+    message: SignalingMessage,
+    update_sender: &mpsc::UnboundedSender<GuiUpdate>,
+) {
+    // Handle unsolicited broadcasts from the server (messages, participant joins/leaves, etc.)
+    match message {
+        SignalingMessage::MessageReceived { sender_id, sender_username, content, timestamp } => {
+            let chat_message = ChatMessage {
+                sender_id,
+                sender_username,
+                content,
+                timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
+            };
+            let _ = update_sender.send(GuiUpdate::ChatMessageReceived { message: chat_message });
+        },
+        SignalingMessage::ParticipantJoined { participant_id, username } => {
+            let participant = ParticipantInfo {
+                id: participant_id.clone(),
+                username: username.clone(),
+                audio_enabled: true,
+                video_enabled: false,
+            };
+            let _ = update_sender.send(GuiUpdate::ParticipantJoined { participant });
+        },
+        SignalingMessage::ParticipantLeft { participant_id } => {
+            let _ = update_sender.send(GuiUpdate::ParticipantLeft { participant_id });
+        },
+        _ => {
+            // Ignore other message types in broadcasts
+        }
+    }
 }
 
 #[cfg(feature = "gui")]
