@@ -27,6 +27,10 @@ path = "src/interactive_client.rs"
 name = "pqc-enhanced-gui"
 path = "src/gui/enhanced_main.rs"
 
+[[bin]]
+name = "pqc-kyber-test"
+path = "src/client/kyber_test_client.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.34", features = ["full"] }
@@ -60,8 +64,17 @@ anyhow = "1.0"
 clap = { version = "4.4", features = ["derive"] }
 parking_lot = "0.12"
 
+# Audio support
+cpal = "0.15"  # Cross-platform audio I/O
+rubato = "0.14"  # Sample rate conversion
+ringbuf = "0.3"  # Lock-free ring buffer for audio
+opus = "0.3"  # Opus audio codec for compression
+
 # Config parsing
 toml = "0.8"
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
 
 [features]
 default = ["gui"]

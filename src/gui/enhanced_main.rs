@@ -28,7 +28,7 @@ fn format_time(time: std::time::SystemTime) -> String {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        
+
         let diff = now.saturating_sub(secs);
         if diff < 60 {
             "now".to_string()
@@ -122,19 +122,24 @@ struct EnhancedPqcChatApp {
     // Media state
     audio_enabled: bool,
     video_enabled: bool,
+    audio_call_active: bool,
+    audio_manager: Option<Arc<Mutex<pqc_chat::audio::AudioManager>>>,
+    audio_producer: Option<Arc<Mutex<ringbuf::HeapProducer<f32>>>>,
+    audio_send_handle: Option<std::thread::JoinHandle<()>>,
 
-    // Chat state
-    chat_messages: Vec<ChatMessage>,
+    // Chat state - per room
+    room_chat_history: HashMap<String, Vec<ChatMessage>>,  // room_id -> messages
     message_input: String,
     
     // UI state
     show_users_panel: bool,
     show_rooms_panel: bool,
+    users_window_open: bool,
     status_messages: Vec<(String, std::time::SystemTime)>,
     
     // Communication
     runtime: Option<Arc<Runtime>>,
-    command_sender: Option<mpsc::UnboundedSender<GuiCommand>>,
+    command_sender: Option<mpsc::Sender<GuiCommand>>,
     update_receiver: Option<Arc<Mutex<mpsc::UnboundedReceiver<GuiUpdate>>>>,
 }
 
@@ -153,6 +158,10 @@ enum GuiCommand {
     ListServerUsers,
     // Chat functionality
     SendMessage { content: String },
+    // Audio call functionality
+    StartAudioCall,
+    StopAudioCall,
+    SendAudioData { data: Vec<u8> },
 }
 
 #[cfg(feature = "gui")]
@@ -175,6 +184,8 @@ enum GuiUpdate {
     // Chat functionality
     ChatMessageReceived { message: ChatMessage },
     StatusMessage { message: String },
+    // Audio functionality
+    AudioDataReceived { sender_id: String, data: Vec<u8> },
 }
 
 #[cfg(feature = "gui")]
@@ -184,8 +195,12 @@ impl EnhancedPqcChatApp {
             Runtime::new().expect("Failed to create tokio runtime")
         );
 
-        let (command_sender, command_receiver) = mpsc::unbounded_channel();
-        let (update_sender, update_receiver) = mpsc::unbounded_channel();
+    // Use a bounded channel for commands so audio data doesn't flood the queue
+    // and create unbounded backpressure that causes large send backlogs and
+    // massive latency. Use try_send from non-async contexts to drop packets
+    // when the queue is full (preferred to unbounded growth).
+    let (command_sender, command_receiver) = mpsc::channel(32);
+    let (update_sender, update_receiver) = mpsc::unbounded_channel();
         let update_receiver = Arc::new(Mutex::new(update_receiver));
 
         // Spawn the communication task
@@ -209,12 +224,17 @@ impl EnhancedPqcChatApp {
             room_participants: Vec::new(),
             connected_users: HashMap::new(),
             user_list_scroll: 0.0,
-            chat_messages: Vec::new(),
+            room_chat_history: HashMap::new(),
             message_input: String::new(),
             audio_enabled: true,
             video_enabled: true,
+            audio_call_active: false,
+            audio_manager: None,
+            audio_producer: None,
+            audio_send_handle: None,
             show_users_panel: true,
             show_rooms_panel: true,
+            users_window_open: true,
             status_messages: Vec::new(),
             runtime: Some(runtime),
             command_sender: Some(command_sender),
@@ -355,14 +375,81 @@ impl EnhancedPqcChatApp {
                     }
                 },
                 GuiUpdate::ChatMessageReceived { message } => {
-                    self.chat_messages.push(message);
-                    // Keep only last 100 messages
-                    if self.chat_messages.len() > 100 {
-                        self.chat_messages.remove(0);
+                    eprintln!("DEBUG: GuiUpdate::ChatMessageReceived - from {} ({}): {}", message.sender_username, message.sender_id, message.content);
+                    
+                    // Only add message if we're in a room
+                    if let Some(ref room) = self.current_room {
+                        let room_id = room.id.clone();
+                        let chat_history = self.room_chat_history.entry(room_id.clone()).or_insert_with(Vec::new);
+                        
+                        // Check for duplicate - don't add if we already have this message
+                        // (this happens when we optimistically add our own message, then get the broadcast)
+                        let is_duplicate = chat_history.iter().any(|m| {
+                            m.content == message.content && 
+                            m.sender_username == message.sender_username &&
+                            m.timestamp.duration_since(message.timestamp).unwrap_or_default().as_secs() < 2
+                        });
+                        
+                        if !is_duplicate {
+                            chat_history.push(message);
+                            // Keep only last 100 messages per room
+                            if chat_history.len() > 100 {
+                                chat_history.remove(0);
+                            }
+                            eprintln!("DEBUG: Added message to room {}. Total messages: {}", room_id, chat_history.len());
+                        } else {
+                            eprintln!("DEBUG: Skipped duplicate message");
+                        }
                     }
                 },
                 GuiUpdate::StatusMessage { message } => {
                     self.add_status_message(message);
+                },
+                GuiUpdate::AudioDataReceived { sender_id, data } => {
+                    // Decode Opus-compressed audio
+                    use pqc_chat::audio_codec::OpusDecoder;
+                    static OPUS_DECODER: std::sync::OnceLock<std::sync::Mutex<OpusDecoder>> = std::sync::OnceLock::new();
+                    
+                    if let Some(producer) = &self.audio_producer {
+                        if let Ok(mut decoder_guard) = OPUS_DECODER.get_or_init(|| {
+                            std::sync::Mutex::new(
+                                OpusDecoder::new().expect("Failed to create Opus decoder")
+                            )
+                        }).lock() {
+                            match decoder_guard.decode(&data) {
+                                Ok(samples) => {
+                                    let num_samples = samples.len();
+                                    let max_amplitude = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                                    
+                                    let mut producer = producer.lock().unwrap();
+                                    
+                                    // Push all samples to buffer
+                                    let mut pushed_count = 0;
+                                    for sample in samples {
+                                        if producer.push(sample).is_ok() {
+                                            pushed_count += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    
+                                    eprintln!("DEBUG: Audio from {}: {} compressed bytes → {} samples, pushed {}, max_amp={:.4}", 
+                                              sender_id, data.len(), num_samples, pushed_count, max_amplitude);
+                                    
+                                    if pushed_count < num_samples {
+                                        eprintln!("WARNING: Buffer full, dropped {} samples", num_samples - pushed_count);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("ERROR: Opus decode failed: {}", e);
+                                }
+                            }
+                        } else {
+                            eprintln!("DEBUG: Received audio but no decoder (call not started?)");
+                        }
+                    } else {
+                        eprintln!("DEBUG: Received audio but no producer (call not started?)");
+                    }
                 },
             }
         }
@@ -378,9 +465,101 @@ impl EnhancedPqcChatApp {
 
     fn send_command(&self, command: GuiCommand) {
         if let Some(sender) = &self.command_sender {
-            let _ = sender.send(command);
+            // Non-blocking send from GUI thread; drop when full instead of blocking
+            let _ = sender.try_send(command);
         }
     }
+
+    fn start_audio_call(&mut self) {
+        log::info!("Starting audio call...");
+        
+        // Create audio manager
+        let mut manager = match pqc_chat::audio::AudioManager::new() {
+            Ok(m) => m,
+            Err(e) => {
+                self.add_status_message(format!("❌ Failed to create audio manager: {}", e));
+                return;
+            }
+        };
+
+        // Start playback first
+        let producer = match manager.start_playback() {
+            Ok(p) => p,
+            Err(e) => {
+                self.add_status_message(format!("❌ Failed to start playback: {}", e));
+                return;
+            }
+        };
+        self.audio_producer = Some(producer);
+
+        // Start capture with callback
+        let command_sender = self.command_sender.clone();
+        let capture_result = manager.start_capture(move |samples| {
+            // Encode to Opus (compresses ~3.8KB to ~100-200 bytes per 20ms)
+            // This reduces network overhead and improves TCP handling
+            use pqc_chat::audio_codec::OpusEncoder;
+            static OPUS_ENCODER: std::sync::OnceLock<std::sync::Mutex<OpusEncoder>> = std::sync::OnceLock::new();
+            
+            if let Ok(mut encoder_guard) = OPUS_ENCODER.get_or_init(|| {
+                std::sync::Mutex::new(
+                    OpusEncoder::new().expect("Failed to create Opus encoder")
+                )
+            }).lock() {
+                match encoder_guard.encode(&samples) {
+                    Ok(compressed) => {
+                        eprintln!("DEBUG: Opus compressed {} samples to {} bytes", samples.len(), compressed.len());
+                        
+                        // Send compressed audio to server (non-blocking)
+                        if let Some(sender) = &command_sender {
+                            let _ = sender.try_send(GuiCommand::SendAudioData { data: compressed });
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("ERROR: Opus encode failed: {}", e);
+                    }
+                }
+            }
+        });
+
+        if let Err(e) = capture_result {
+            self.add_status_message(format!("❌ Failed to start capture: {}", e));
+            manager.stop_playback();
+            self.audio_producer = None;
+            return;
+        }
+
+        self.audio_manager = Some(Arc::new(Mutex::new(manager)));
+        self.add_status_message("🎤 Audio call started - speak now!".to_string());
+        log::info!("Audio call started successfully");
+    }
+
+    fn stop_audio_call(&mut self) {
+        log::info!("Stopping audio call...");
+        
+        // Clear any buffered audio first
+        if let Some(producer) = &self.audio_producer {
+            let mut producer = producer.lock().unwrap();
+            // Drain all samples from buffer
+            while producer.push(0.0).is_ok() {
+                // Fill with silence to flush old audio
+            }
+            eprintln!("DEBUG: Cleared audio buffer on stop");
+        }
+        
+        // Stop audio manager
+        if let Some(manager_arc) = self.audio_manager.take() {
+            if let Ok(mut manager) = manager_arc.lock() {
+                manager.stop_all();
+            }
+        }
+        
+        // Clear producer reference
+        self.audio_producer = None;
+        
+        self.add_status_message("🔇 Audio call ended".to_string());
+        log::info!("Audio call stopped");
+    }
+
 }
 
 #[cfg(feature = "gui")]
@@ -400,7 +579,11 @@ impl eframe::App for EnhancedPqcChatApp {
                 ui.label(&self.connection_status);
                 ui.separator();
                 
-                ui.checkbox(&mut self.show_users_panel, "👥 Users");
+                let users_resp = ui.checkbox(&mut self.show_users_panel, "👥 Users");
+                // Keep the floating window open state in sync with the checkbox
+                if users_resp.changed() {
+                    self.users_window_open = self.show_users_panel;
+                }
                 ui.checkbox(&mut self.show_rooms_panel, "🏠 Rooms");
                 
                 if self.is_connected {
@@ -519,7 +702,8 @@ impl eframe::App for EnhancedPqcChatApp {
             });
 
         // Right panel - Connected Users
-        if self.show_users_panel {
+        // Hide the server-wide users panel when we're inside a room (to avoid layout issues)
+        if self.show_users_panel && self.current_room.is_none() {
             egui::SidePanel::right("users_panel")
                 .resizable(true)
                 .default_width(250.0)
@@ -588,6 +772,46 @@ impl eframe::App for EnhancedPqcChatApp {
                 });
         }
 
+        // Chat input bottom panel - only show when in a room
+        if self.current_room.is_some() {
+            egui::TopBottomPanel::bottom("chat_input_panel")
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let response = ui.text_edit_singleline(&mut self.message_input);
+
+                        let send_clicked = ui.button("📤 Send").clicked();
+                        let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                        if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
+                            let content = self.message_input.trim().to_string();
+
+                            // Optimistic update: show your own message immediately for better UX
+                            // The deduplication logic will prevent it from showing twice when broadcast returns
+                            if let Some(ref room) = self.current_room {
+                                let room_id = room.id.clone();
+                                let chat_history = self.room_chat_history.entry(room_id).or_insert_with(Vec::new);
+                                
+                                chat_history.push(ChatMessage {
+                                    sender_id: "optimistic".to_string(),
+                                    sender_username: self.username.clone(),
+                                    content: content.clone(),
+                                    timestamp: std::time::SystemTime::now(),
+                                });
+                                
+                                if chat_history.len() > 100 {
+                                    chat_history.remove(0);
+                                }
+                            }
+
+                            // Send message - server will broadcast to everyone (including us)
+                            self.send_command(GuiCommand::SendMessage { content });
+                            self.message_input.clear();
+                            response.request_focus();
+                        }
+                    });
+                });
+        }
+
         // Central panel - Chat and room controls
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.is_connected {
@@ -623,32 +847,51 @@ impl eframe::App for EnhancedPqcChatApp {
                         }
                         
                         ui.separator();
+                        
+                        // Audio call control
+                        if self.audio_call_active {
+                            if ui.button("📞 End Call").on_hover_text("Stop audio call").clicked() {
+                                self.audio_call_active = false;
+                                self.stop_audio_call();
+                            }
+                        } else {
+                            if ui.button("📞 Start Call").on_hover_text("Start audio call with room participants").clicked() {
+                                self.audio_call_active = true;
+                                self.start_audio_call();
+                            }
+                        }
+                        
+                        ui.separator();
                         ui.label(format!("👥 {} participants", self.room_participants.len()));
                     });
                     
                     ui.separator();
-                    
-                    // Main content area - split between chat and participants
-                    ui.horizontal(|ui| {
-                        // Chat area (70% width)
-                        ui.vertical(|ui| {
-                            ui.set_min_width(ui.available_width() * 0.7);
-                            
-                            ui.heading("💬 Chat");
-                            
-                            // Chat messages area
-                            let chat_height = ui.available_height() - 60.0; // Reserve space for input
-                            egui::ScrollArea::vertical()
-                                .max_height(chat_height)
-                                .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    if self.chat_messages.is_empty() {
+
+                    // Chat area - full width, scrollable, extends from header to input bar
+                    ui.vertical(|ui| {
+                        let chat_max_h = ui.available_height();
+                        ui.set_min_height(chat_max_h);
+                        
+                        egui::ScrollArea::vertical()
+                            .id_source("chat_scroll_area")
+                            .max_height(chat_max_h)
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                // Get messages for current room
+                                let messages = if let Some(ref room) = self.current_room {
+                                    self.room_chat_history.get(&room.id)
+                                } else {
+                                    None
+                                };
+                                
+                                if let Some(msgs) = messages {
+                                    if msgs.is_empty() {
                                         ui.vertical_centered(|ui| {
                                             ui.label("🗨️ No messages yet");
                                             ui.small("Start the conversation!");
                                         });
                                     } else {
-                                        for msg in &self.chat_messages {
+                                        for msg in msgs {
                                             ui.group(|ui| {
                                                 ui.horizontal(|ui| {
                                                     if msg.sender_username == self.username {
@@ -663,53 +906,15 @@ impl eframe::App for EnhancedPqcChatApp {
                                             ui.separator();
                                         }
                                     }
-                                });
-                            
-                            ui.separator();
-                            
-                            // Message input
-                            ui.horizontal(|ui| {
-                                let response = ui.text_edit_singleline(&mut self.message_input);
-                                
-                                let send_clicked = ui.button("📤 Send").clicked();
-                                let enter_pressed = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                
-                                if (send_clicked || enter_pressed) && !self.message_input.trim().is_empty() {
-                                    let content = self.message_input.trim().to_string();
-                                    self.send_command(GuiCommand::SendMessage { content });
-                                    self.message_input.clear();
-                                    response.request_focus();
+                                } else {
+                                    ui.vertical_centered(|ui| {
+                                        ui.label("🗨️ No messages yet");
+                                        ui.small("Start the conversation!");
+                                    });
                                 }
                             });
-                        });
-                        
-                        ui.separator();
-                        
-                        // Participants area (30% width)
-                        ui.vertical(|ui| {
-                            ui.heading("👥 Participants");
-                            
-                            egui::ScrollArea::vertical()
-                                .show(ui, |ui| {
-                                    for participant in &self.room_participants {
-                                        ui.horizontal(|ui| {
-                                            let audio_icon = if participant.audio_enabled { "🎤" } else { "🔇" };
-                                            let video_icon = if participant.video_enabled { "📹" } else { "📺" };
-                                            
-                                            ui.label(format!("{} {}", audio_icon, video_icon));
-                                            
-                                            if participant.username == self.username {
-                                                ui.strong(&participant.username);
-                                                ui.small("(You)");
-                                            } else {
-                                                ui.label(&participant.username);
-                                            }
-                                        });
-                                        ui.separator();
-                                    }
-                                });
-                        });
                     });
+
                 } else {
                     ui.vertical_centered(|ui| {
                         ui.heading("Welcome to PQC Chat!");
@@ -742,56 +947,161 @@ impl eframe::App for EnhancedPqcChatApp {
                 });
             }
         });
+
+        // Floating users window when in a room (controlled by the Users checkbox)
+        if self.show_users_panel && self.current_room.is_some() && self.users_window_open {
+            let mut users_open = self.users_window_open;
+            egui::Window::new("👥 Connected Users (Server-wide)")
+                .open(&mut users_open)
+                .resizable(true)
+                .default_width(320.0)
+                .default_height(400.0)
+                .collapsible(true)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("👥 Connected Users (Server-wide)");
+                        if ui.button("🔄").on_hover_text("Refresh user list").clicked() {
+                            self.send_command(GuiCommand::ListServerUsers);
+                        }
+                    });
+                    ui.separator();
+
+                    ui.label("All users connected to the server:");
+                    ui.label(format!("Currently showing: {} users", self.connected_users.len()));
+                    ui.separator();
+
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            if self.connected_users.is_empty() {
+                                ui.vertical_centered(|ui| {
+                                    ui.label("📭 No users found");
+                                    ui.small("Click refresh or check server connection");
+                                });
+                            } else {
+                                for (user_id, user) in &self.connected_users {
+                                    ui.group(|ui| {
+                                        ui.horizontal(|ui| {
+                                            let audio_icon = if user.audio_enabled { "🎤" } else { "🔇" };
+                                            let video_icon = if user.video_enabled { "📹" } else { "📺" };
+
+                                            ui.label(format!("{} {}", audio_icon, video_icon));
+
+                                            if user.username == self.username {
+                                                ui.strong(&user.username);
+                                                ui.label("(You)");
+                                            } else {
+                                                ui.label(&user.username);
+                                            }
+                                        });
+
+                                        if let Some(room) = &user.in_room {
+                                            ui.label(format!("🏠 In room: {}", room));
+                                        } else {
+                                            ui.label("🏠 In lobby");
+                                        }
+
+                                        if let Ok(duration) = user.connected_at.elapsed() {
+                                            let mins = duration.as_secs() / 60;
+                                            if mins > 0 {
+                                                ui.label(format!("⏱️ Online {}m", mins));
+                                            } else {
+                                                ui.label("⏱️ Just joined");
+                                            }
+                                        } else {
+                                            ui.label("⏱️ Online");
+                                        }
+
+                                        ui.small(format!("ID: {}", user_id));
+                                    });
+                                    ui.separator();
+                                }
+                            }
+                        });
+                });
+            // commit any user-closed change back into the app state
+            self.users_window_open = users_open;
+        }
     }
 }
 
 #[cfg(feature = "gui")]
 async fn communication_task(
-    mut command_receiver: mpsc::UnboundedReceiver<GuiCommand>,
+    mut command_receiver: mpsc::Receiver<GuiCommand>,
     update_sender: mpsc::UnboundedSender<GuiUpdate>,
 ) {
     use tokio::net::TcpStream;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
     
-    let mut connection: Option<tokio_rustls::client::TlsStream<TcpStream>> = None;
+    let mut connection: Option<Arc<Mutex<tokio_rustls::client::TlsStream<TcpStream>>>> = None;
     let mut _participant_id: Option<String> = None;
     let mut current_username: Option<String> = None;
     
-    while let Some(command) = command_receiver.recv().await {
-        match command {
-            GuiCommand::Connect { host, port, username } => {
-                match connect_to_server(&host, port, &username, &update_sender).await {
-                    Ok((stream, pid)) => {
-                        connection = Some(stream);
-                        _participant_id = Some(pid.clone());
-                        current_username = Some(username.clone());
-                        let _ = update_sender.send(GuiUpdate::Connected { participant_id: pid.clone() });
-                        
-                        // Request initial room list
-                        if let Some(ref mut conn) = connection {
-                            let _ = send_message(conn, &SignalingMessage::ListRooms).await;
+    loop {
+        if let Some(ref conn_arc) = connection.clone() {
+            // When connected, listen for both commands and incoming messages
+            let conn_arc_cmd = conn_arc.clone();
+            let conn_arc_recv = conn_arc.clone();
+            
+            tokio::select! {
+                Some(command) = command_receiver.recv() => {
+                    let mut conn = conn_arc_cmd.lock().await;
+                    let username = current_username.as_deref().unwrap_or("User");
+                    match command {
+                        GuiCommand::Disconnect => {
+                            connection = None;
+                            _participant_id = None;
+                            current_username = None;
+                            let _ = update_sender.send(GuiUpdate::Disconnected);
+                        },
+                        _ => {
+                            let _ = handle_command(&mut *conn, command, &update_sender, username).await;
                         }
-                    },
-                    Err(e) => {
-                        let _ = update_sender.send(GuiUpdate::ConnectionError { 
-                            error: e.to_string() 
-                        });
                     }
                 }
-            },
-            GuiCommand::Disconnect => {
-                connection = None;
-                _participant_id = None;
-                current_username = None;
-                let _ = update_sender.send(GuiUpdate::Disconnected);
-            },
-            _ if connection.is_some() => {
-                if let Some(ref mut conn) = connection {
-                    let username = current_username.as_deref().unwrap_or("User");
-                    let _ = handle_command(conn, command, &update_sender, username).await;
+                result = async {
+                    let mut conn = conn_arc_recv.lock().await;
+                    receive_message(&mut *conn).await
+                } => {
+                    match result {
+                        Ok(msg) => {
+                            eprintln!("DEBUG: Received message in main loop: {:?}", msg);
+                            process_server_message(msg, &update_sender).await;
+                        }
+                        Err(e) => {
+                            eprintln!("DEBUG: Connection error in main loop: {:?}", e);
+                            // Connection closed
+                            connection = None;
+                            let _ = update_sender.send(GuiUpdate::Disconnected);
+                        }
+                    }
                 }
-            },
-            _ => {
-                // Ignore commands when not connected
+            }
+        } else {
+            // Not connected, just wait for connect command
+            if let Some(command) = command_receiver.recv().await {
+                if let GuiCommand::Connect { host, port, username } = command {
+                    match connect_to_server(&host, port, &username, &update_sender).await {
+                        Ok((stream, pid)) => {
+                            connection = Some(Arc::new(Mutex::new(stream)));
+                            _participant_id = Some(pid.clone());
+                            current_username = Some(username.clone());
+                            let _ = update_sender.send(GuiUpdate::Connected { participant_id: pid.clone() });
+                            
+                            // Request initial room list
+                            if let Some(ref conn_arc) = connection {
+                                let mut conn = conn_arc.lock().await;
+                                let _ = send_message(&mut *conn, &SignalingMessage::ListRooms).await;
+                            }
+                        },
+                        Err(e) => {
+                            let _ = update_sender.send(GuiUpdate::ConnectionError { 
+                                error: e.to_string() 
+                            });
+                        }
+                    }
+                }
             }
         }
     }
@@ -876,7 +1186,29 @@ async fn handle_command(
         GuiCommand::ToggleAudio { enabled } => SignalingMessage::ToggleAudio { enabled },
         GuiCommand::ToggleVideo { enabled } => SignalingMessage::ToggleVideo { enabled },
         GuiCommand::ListServerUsers => SignalingMessage::ListServerUsers,
-        GuiCommand::SendMessage { content } => SignalingMessage::SendMessage { content },
+        GuiCommand::SendMessage { content } => {
+            // Send chat message
+            let msg = SignalingMessage::SendMessage { content: content.clone() };
+            eprintln!("DEBUG: Sending message to server: {}", content);
+            eprintln!("DEBUG: Message JSON: {}", serde_json::to_string(&msg).unwrap_or_else(|_| "ERROR".to_string()));
+            send_message(stream, &msg).await?;
+            // Read and discard the acknowledgment response
+            // The actual message will come via broadcast to all participants
+            let ack = receive_message(stream).await?;
+            eprintln!("DEBUG: Received acknowledgment: {:?}", ack);
+            return Ok(());
+        },
+        GuiCommand::SendAudioData { data } => {
+            // Send audio data through signaling
+            let msg = SignalingMessage::AudioData { data };
+            send_message(stream, &msg).await?;
+            // Audio data doesn't need response
+            return Ok(());
+        },
+        GuiCommand::StartAudioCall | GuiCommand::StopAudioCall => {
+            // These are handled locally in the GUI
+            return Ok(());
+        },
         _ => return Ok(()),
     };
     
@@ -962,6 +1294,46 @@ async fn handle_command(
     }
     
     Ok(())
+}
+
+#[cfg(feature = "gui")]
+async fn process_server_message(
+    message: SignalingMessage,
+    update_sender: &mpsc::UnboundedSender<GuiUpdate>,
+) {
+    eprintln!("DEBUG: process_server_message called with: {:?}", message);
+    // Handle unsolicited broadcasts from the server (messages, participant joins/leaves, etc.)
+    match message {
+        SignalingMessage::MessageReceived { sender_id, sender_username, content, timestamp } => {
+            eprintln!("DEBUG: Processing MessageReceived from {} ({}): {}", sender_username, sender_id, content);
+            let chat_message = ChatMessage {
+                sender_id: sender_id.clone(),
+                sender_username: sender_username.clone(),
+                content: content.clone(),
+                timestamp: std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp),
+            };
+            eprintln!("DEBUG: Sending GuiUpdate::ChatMessageReceived");
+            let _ = update_sender.send(GuiUpdate::ChatMessageReceived { message: chat_message });
+        },
+        SignalingMessage::ParticipantJoined { participant_id, username } => {
+            let participant = ParticipantInfo {
+                id: participant_id.clone(),
+                username: username.clone(),
+                audio_enabled: true,
+                video_enabled: false,
+            };
+            let _ = update_sender.send(GuiUpdate::ParticipantJoined { participant });
+        },
+        SignalingMessage::ParticipantLeft { participant_id } => {
+            let _ = update_sender.send(GuiUpdate::ParticipantLeft { participant_id });
+        },
+        SignalingMessage::AudioDataReceived { sender_id, data } => {
+            let _ = update_sender.send(GuiUpdate::AudioDataReceived { sender_id, data });
+        },
+        _ => {
+            // Ignore other message types in broadcasts
+        }
+    }
 }
 
 #[cfg(feature = "gui")]
