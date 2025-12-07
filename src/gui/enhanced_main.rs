@@ -224,7 +224,7 @@ impl EnhancedPqcChatApp {
 
         Self {
             server_host: "192.168.10.101".to_string(),
-            server_port: "8443".to_string(),
+            server_port: "8444".to_string(),
             username: std::env::var("USER").unwrap_or_else(|_| "PiUser".to_string()),
             is_connected: false,
             connection_status: "Disconnected".to_string(),
