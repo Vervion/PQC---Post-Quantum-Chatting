@@ -8,6 +8,7 @@ pub mod protocol;
 pub mod room;
 pub mod media;
 pub mod config;
+pub mod audio;
 
 pub use crypto::kyber::KyberKeyExchange;
 pub use protocol::SignalingMessage;

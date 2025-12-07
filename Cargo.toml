@@ -60,6 +60,11 @@ anyhow = "1.0"
 clap = { version = "4.4", features = ["derive"] }
 parking_lot = "0.12"
 
+# Audio support
+cpal = "0.15"  # Cross-platform audio I/O
+rubato = "0.14"  # Sample rate conversion
+ringbuf = "0.3"  # Lock-free ring buffer for audio
+
 # Config parsing
 toml = "0.8"
 

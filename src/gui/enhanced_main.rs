@@ -122,6 +122,11 @@ struct EnhancedPqcChatApp {
     // Media state
     audio_enabled: bool,
     video_enabled: bool,
+    audio_call_active: bool,
+    audio_manager: Option<Arc<Mutex<pqc_chat::audio::AudioManager>>>,
+    audio_producer: Option<Arc<Mutex<ringbuf::HeapProducer<f32>>>>,
+    audio_send_handle: Option<std::thread::JoinHandle<()>>,
+    audio_packet_counter: u32,  // For aggressive latency control
 
     // Chat state - per room
     room_chat_history: HashMap<String, Vec<ChatMessage>>,  // room_id -> messages
@@ -154,6 +159,10 @@ enum GuiCommand {
     ListServerUsers,
     // Chat functionality
     SendMessage { content: String },
+    // Audio call functionality
+    StartAudioCall,
+    StopAudioCall,
+    SendAudioData { data: Vec<u8> },
 }
 
 #[cfg(feature = "gui")]
@@ -176,6 +185,8 @@ enum GuiUpdate {
     // Chat functionality
     ChatMessageReceived { message: ChatMessage },
     StatusMessage { message: String },
+    // Audio functionality
+    AudioDataReceived { sender_id: String, data: Vec<u8> },
 }
 
 #[cfg(feature = "gui")]
@@ -214,6 +225,11 @@ impl EnhancedPqcChatApp {
             message_input: String::new(),
             audio_enabled: true,
             video_enabled: true,
+            audio_call_active: false,
+            audio_manager: None,
+            audio_producer: None,
+            audio_send_handle: None,
+            audio_packet_counter: 0,
             show_users_panel: true,
             show_rooms_panel: true,
             users_window_open: true,
@@ -387,6 +403,45 @@ impl EnhancedPqcChatApp {
                 GuiUpdate::StatusMessage { message } => {
                     self.add_status_message(message);
                 },
+                GuiUpdate::AudioDataReceived { sender_id, data } => {
+                    // Play received audio data
+                    if let Some(producer) = &self.audio_producer {
+                        // AGGRESSIVE LATENCY CONTROL: Drop every 3rd packet to prevent buildup
+                        // This trades quality for latency
+                        self.audio_packet_counter += 1;
+                        if self.audio_packet_counter % 3 == 0 {
+                            eprintln!("WARNING: Dropping packet #{} to maintain low latency", self.audio_packet_counter);
+                            return;
+                        }
+                        
+                        let samples = pqc_chat::audio::bytes_to_samples(&data);
+                        let num_samples = samples.len();
+                        
+                        // Calculate audio statistics
+                        let max_amplitude = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                        
+                        let mut producer = producer.lock().unwrap();
+                        
+                        // Try to push all samples
+                        let mut pushed_count = 0;
+                        for sample in samples {
+                            if producer.push(sample).is_ok() {
+                                pushed_count += 1;
+                            } else {
+                                break; // Buffer completely full
+                            }
+                        }
+                        
+                        eprintln!("DEBUG: Audio packet #{}: {} samples, pushed {}, max_amp={:.4}", 
+                                  self.audio_packet_counter, num_samples, pushed_count, max_amplitude);
+                        
+                        if pushed_count < num_samples {
+                            eprintln!("WARNING: Buffer overflow! Dropped {} samples", num_samples - pushed_count);
+                        }
+                    } else {
+                        eprintln!("DEBUG: Received audio but no producer (call not started?)");
+                    }
+                },
             }
         }
     }
@@ -404,6 +459,80 @@ impl EnhancedPqcChatApp {
             let _ = sender.send(command);
         }
     }
+
+    fn start_audio_call(&mut self) {
+        log::info!("Starting audio call...");
+        
+        // Create audio manager
+        let mut manager = match pqc_chat::audio::AudioManager::new() {
+            Ok(m) => m,
+            Err(e) => {
+                self.add_status_message(format!("❌ Failed to create audio manager: {}", e));
+                return;
+            }
+        };
+
+        // Start playback first
+        let producer = match manager.start_playback() {
+            Ok(p) => p,
+            Err(e) => {
+                self.add_status_message(format!("❌ Failed to start playback: {}", e));
+                return;
+            }
+        };
+        self.audio_producer = Some(producer);
+
+        // Start capture with callback
+        let command_sender = self.command_sender.clone();
+        let capture_result = manager.start_capture(move |samples| {
+            // Convert samples to bytes
+            let bytes = pqc_chat::audio::samples_to_bytes(&samples);
+            
+            // Send to server
+            if let Some(sender) = &command_sender {
+                let _ = sender.send(GuiCommand::SendAudioData { data: bytes });
+            }
+        });
+
+        if let Err(e) = capture_result {
+            self.add_status_message(format!("❌ Failed to start capture: {}", e));
+            manager.stop_playback();
+            self.audio_producer = None;
+            return;
+        }
+
+        self.audio_manager = Some(Arc::new(Mutex::new(manager)));
+        self.add_status_message("🎤 Audio call started - speak now!".to_string());
+        log::info!("Audio call started successfully");
+    }
+
+    fn stop_audio_call(&mut self) {
+        log::info!("Stopping audio call...");
+        
+        // Clear any buffered audio first
+        if let Some(producer) = &self.audio_producer {
+            let mut producer = producer.lock().unwrap();
+            // Drain all samples from buffer
+            while producer.push(0.0).is_ok() {
+                // Fill with silence to flush old audio
+            }
+            eprintln!("DEBUG: Cleared audio buffer on stop");
+        }
+        
+        // Stop audio manager
+        if let Some(manager_arc) = self.audio_manager.take() {
+            if let Ok(mut manager) = manager_arc.lock() {
+                manager.stop_all();
+            }
+        }
+        
+        // Clear producer reference
+        self.audio_producer = None;
+        
+        self.add_status_message("🔇 Audio call ended".to_string());
+        log::info!("Audio call stopped");
+    }
+
 }
 
 #[cfg(feature = "gui")]
@@ -687,6 +816,21 @@ impl eframe::App for EnhancedPqcChatApp {
                             if ui.button("📺").on_hover_text("Turn video ON").clicked() {
                                 self.video_enabled = true;
                                 self.send_command(GuiCommand::ToggleVideo { enabled: true });
+                            }
+                        }
+                        
+                        ui.separator();
+                        
+                        // Audio call control
+                        if self.audio_call_active {
+                            if ui.button("📞 End Call").on_hover_text("Stop audio call").clicked() {
+                                self.audio_call_active = false;
+                                self.stop_audio_call();
+                            }
+                        } else {
+                            if ui.button("📞 Start Call").on_hover_text("Start audio call with room participants").clicked() {
+                                self.audio_call_active = true;
+                                self.start_audio_call();
                             }
                         }
                         
@@ -1027,6 +1171,17 @@ async fn handle_command(
             eprintln!("DEBUG: Received acknowledgment: {:?}", ack);
             return Ok(());
         },
+        GuiCommand::SendAudioData { data } => {
+            // Send audio data through signaling
+            let msg = SignalingMessage::AudioData { data };
+            send_message(stream, &msg).await?;
+            // Audio data doesn't need response
+            return Ok(());
+        },
+        GuiCommand::StartAudioCall | GuiCommand::StopAudioCall => {
+            // These are handled locally in the GUI
+            return Ok(());
+        },
         _ => return Ok(()),
     };
     
@@ -1144,6 +1299,9 @@ async fn process_server_message(
         },
         SignalingMessage::ParticipantLeft { participant_id } => {
             let _ = update_sender.send(GuiUpdate::ParticipantLeft { participant_id });
+        },
+        SignalingMessage::AudioDataReceived { sender_id, data } => {
+            let _ = update_sender.send(GuiUpdate::AudioDataReceived { sender_id, data });
         },
         _ => {
             // Ignore other message types in broadcasts
