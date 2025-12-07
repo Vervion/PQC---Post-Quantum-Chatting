@@ -139,7 +139,7 @@ struct EnhancedPqcChatApp {
     
     // Communication
     runtime: Option<Arc<Runtime>>,
-    command_sender: Option<mpsc::UnboundedSender<GuiCommand>>,
+    command_sender: Option<mpsc::Sender<GuiCommand>>,
     update_receiver: Option<Arc<Mutex<mpsc::UnboundedReceiver<GuiUpdate>>>>,
 }
 
@@ -195,8 +195,12 @@ impl EnhancedPqcChatApp {
             Runtime::new().expect("Failed to create tokio runtime")
         );
 
-        let (command_sender, command_receiver) = mpsc::unbounded_channel();
-        let (update_sender, update_receiver) = mpsc::unbounded_channel();
+    // Use a bounded channel for commands so audio data doesn't flood the queue
+    // and create unbounded backpressure that causes large send backlogs and
+    // massive latency. Use try_send from non-async contexts to drop packets
+    // when the queue is full (preferred to unbounded growth).
+    let (command_sender, command_receiver) = mpsc::channel(32);
+    let (update_sender, update_receiver) = mpsc::unbounded_channel();
         let update_receiver = Arc::new(Mutex::new(update_receiver));
 
         // Spawn the communication task
@@ -402,32 +406,46 @@ impl EnhancedPqcChatApp {
                     self.add_status_message(message);
                 },
                 GuiUpdate::AudioDataReceived { sender_id, data } => {
-                    // Play received audio data with stable buffering
+                    // Decode Opus-compressed audio
+                    use pqc_chat::audio_codec::OpusDecoder;
+                    static OPUS_DECODER: std::sync::OnceLock<std::sync::Mutex<OpusDecoder>> = std::sync::OnceLock::new();
+                    
                     if let Some(producer) = &self.audio_producer {
-                        let samples = pqc_chat::audio::bytes_to_samples(&data);
-                        let num_samples = samples.len();
-                        
-                        // Calculate audio statistics
-                        let max_amplitude = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        
-                        let mut producer = producer.lock().unwrap();
-                        
-                        // Push all samples to buffer - let the playback handle underruns
-                        let mut pushed_count = 0;
-                        for sample in samples {
-                            if producer.push(sample).is_ok() {
-                                pushed_count += 1;
-                            } else {
-                                // Buffer full - skip remaining samples this packet
-                                break;
+                        if let Ok(mut decoder_guard) = OPUS_DECODER.get_or_init(|| {
+                            std::sync::Mutex::new(
+                                OpusDecoder::new().expect("Failed to create Opus decoder")
+                            )
+                        }).lock() {
+                            match decoder_guard.decode(&data) {
+                                Ok(samples) => {
+                                    let num_samples = samples.len();
+                                    let max_amplitude = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+                                    
+                                    let mut producer = producer.lock().unwrap();
+                                    
+                                    // Push all samples to buffer
+                                    let mut pushed_count = 0;
+                                    for sample in samples {
+                                        if producer.push(sample).is_ok() {
+                                            pushed_count += 1;
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    
+                                    eprintln!("DEBUG: Audio from {}: {} compressed bytes → {} samples, pushed {}, max_amp={:.4}", 
+                                              sender_id, data.len(), num_samples, pushed_count, max_amplitude);
+                                    
+                                    if pushed_count < num_samples {
+                                        eprintln!("WARNING: Buffer full, dropped {} samples", num_samples - pushed_count);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("ERROR: Opus decode failed: {}", e);
+                                }
                             }
-                        }
-                        
-                        eprintln!("DEBUG: Audio from {}: {} samples, pushed {}, max_amp={:.4}", 
-                                  sender_id, num_samples, pushed_count, max_amplitude);
-                        
-                        if pushed_count < num_samples {
-                            eprintln!("WARNING: Buffer full, dropped {} samples", num_samples - pushed_count);
+                        } else {
+                            eprintln!("DEBUG: Received audio but no decoder (call not started?)");
                         }
                     } else {
                         eprintln!("DEBUG: Received audio but no producer (call not started?)");
@@ -447,7 +465,8 @@ impl EnhancedPqcChatApp {
 
     fn send_command(&self, command: GuiCommand) {
         if let Some(sender) = &self.command_sender {
-            let _ = sender.send(command);
+            // Non-blocking send from GUI thread; drop when full instead of blocking
+            let _ = sender.try_send(command);
         }
     }
 
@@ -476,12 +495,29 @@ impl EnhancedPqcChatApp {
         // Start capture with callback
         let command_sender = self.command_sender.clone();
         let capture_result = manager.start_capture(move |samples| {
-            // Convert samples to bytes
-            let bytes = pqc_chat::audio::samples_to_bytes(&samples);
+            // Encode to Opus (compresses ~3.8KB to ~100-200 bytes per 20ms)
+            // This reduces network overhead and improves TCP handling
+            use pqc_chat::audio_codec::OpusEncoder;
+            static OPUS_ENCODER: std::sync::OnceLock<std::sync::Mutex<OpusEncoder>> = std::sync::OnceLock::new();
             
-            // Send to server
-            if let Some(sender) = &command_sender {
-                let _ = sender.send(GuiCommand::SendAudioData { data: bytes });
+            if let Ok(mut encoder_guard) = OPUS_ENCODER.get_or_init(|| {
+                std::sync::Mutex::new(
+                    OpusEncoder::new().expect("Failed to create Opus encoder")
+                )
+            }).lock() {
+                match encoder_guard.encode(&samples) {
+                    Ok(compressed) => {
+                        eprintln!("DEBUG: Opus compressed {} samples to {} bytes", samples.len(), compressed.len());
+                        
+                        // Send compressed audio to server (non-blocking)
+                        if let Some(sender) = &command_sender {
+                            let _ = sender.try_send(GuiCommand::SendAudioData { data: compressed });
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("ERROR: Opus encode failed: {}", e);
+                    }
+                }
             }
         });
 
@@ -991,7 +1027,7 @@ impl eframe::App for EnhancedPqcChatApp {
 
 #[cfg(feature = "gui")]
 async fn communication_task(
-    mut command_receiver: mpsc::UnboundedReceiver<GuiCommand>,
+    mut command_receiver: mpsc::Receiver<GuiCommand>,
     update_sender: mpsc::UnboundedSender<GuiUpdate>,
 ) {
     use tokio::net::TcpStream;

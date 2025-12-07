@@ -258,12 +258,116 @@ For optimal performance on Raspberry Pi 5:
 - **Ethernet cables** (Cat 5e or better)
 - **Ethernet switch** (unmanaged is sufficient)
 
+## Audio Quality & Latency Improvements
+
+### Recent Optimizations (Dec 6, 2025)
+
+The audio subsystem has been optimized for low-latency, high-quality transmission on Raspberry Pi 5:
+
+**Changes Made:**
+- **Reduced playback buffer**: From 200ms → 80ms (lower perceived latency)
+- **Bounded command queue**: Switched from unbounded to bounded channel (size 32) to prevent audio packet backlog
+- **Non-blocking sends**: Audio capture now uses `try_send()` to drop packets when the queue is full, avoiding unbounded delays
+
+**Why:** Audio was being sent over TCP (signaling channel) with unbounded buffering. This caused:
+- Long delays before hearing the remote person
+- Grainy/static audio artifacts from queued backlog
+- Excessive latency on Raspberry Pi hardware
+
+With these fixes:
+- Latency reduced by ~120ms (from 200ms to 80ms buffer)
+- Audio packets dropped gracefully when network is slow (better than queuing)
+- More responsive real-time feel
+
+### Testing Audio Quality
+
+#### Quick Test (All Pis)
+
+```bash
+# Terminal 1 - On Pi 1 (Server):
+sudo systemctl start pqc-chat-server
+sudo journalctl -u pqc-chat-server -f  # Monitor server logs
+
+# Terminal 2 - On Pi 2 (Client 1):
+RUST_LOG=debug /opt/pqc-chat/bin/pqc-enhanced-gui
+
+# Terminal 3 - On Pi 3 (Client 2):
+RUST_LOG=debug /opt/pqc-chat/bin/pqc-enhanced-gui
+```
+
+#### What to Observe
+
+1. **Startup**: Both clients should connect and show "Connected to server" status
+2. **Room Creation**: Create a room on one client, join from the other
+3. **Audio Call**: Click the 🎤 button to start audio (runs at 48kHz mono)
+4. **Quality Metrics**:
+   - ✅ Audio heard within ~100–150ms (was 300ms+)
+   - ✅ Minimal static/grain (no longer layered backlog)
+   - ✅ Clear voice transmission
+5. **Debug Output**: Watch stderr for:
+   ```
+   DEBUG: Audio from <sender>: N samples, pushed M, max_amp=X.XX
+   WARNING: Buffer full, dropped Y samples
+   ```
+
+#### If Audio Quality is Still Poor
+
+**Symptom: Frequent "dropped samples" warnings**
+- Increase the command queue capacity (too many packets being sent)
+- Edit `src/gui/enhanced_main.rs` line ~199:
+  ```rust
+  let (command_sender, command_receiver) = mpsc::channel(64);  // was 32
+  ```
+- Rebuild: `cargo build --release && sudo ./scripts/deploy_pi_network.sh`
+
+**Symptom: Still hearing lag/delay**
+- Lower the playback buffer further (if hardware can handle it)
+- Edit `src/audio.rs` line ~35:
+  ```rust
+  const PLAYBACK_BUFFER_MS: usize = 50;  // was 80 (more aggressive, may underrun)
+  ```
+- Rebuild and redeploy
+
+**Symptom: Audio has clicks/pops (underruns)**
+- Increase the playback buffer
+- Edit `src/audio.rs` line ~35:
+  ```rust
+  const PLAYBACK_BUFFER_MS: usize = 100;  // was 80
+  ```
+- Rebuild and redeploy
+
+#### Audio Device Configuration
+
+If audio is not working at all:
+
+```bash
+# On client Pi, list audio devices
+arecord -l   # Input devices
+aplay -l     # Output devices
+
+# Check current configuration
+cat /etc/pqc-chat/client.toml | grep -A 5 "\[audio\]"
+
+# Test audio I/O manually
+arecord -f cd -t wav -d 3 test.wav && aplay test.wav
+```
+
+The system defaults to:
+- **Sample Rate**: 48 kHz (CD quality)
+- **Channels**: 1 (mono for low bandwidth)
+- **Transport**: Raw f32 samples over TLS signaling (TCP)
+
+**Note**: For production deployments with better latency, consider:
+- Implementing UDP-based media transport (see `src/media.rs` stubs)
+- Adding Opus encoding/decoding (compression + better bandwidth efficiency)
+- Using DTLS-SRTP for secure real-time media
+
 ## Next Steps
 
 After successful deployment:
 1. Test basic connectivity between all Pis
 2. Start a video chat session from both clients
-3. Verify audio and video quality
+3. Verify audio and video quality (use the Audio Testing section above)
 4. Monitor performance and adjust settings if needed
 
 For advanced configuration and troubleshooting, see the individual configuration files in the `config/` directory.

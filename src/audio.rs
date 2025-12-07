@@ -27,7 +27,9 @@ pub enum AudioError {
 const SAMPLE_RATE: u32 = 48000;  // 48kHz standard audio
 const CHANNELS: u16 = 1;  // Mono audio
 const BUFFER_SIZE: usize = 960;  // 20ms at 48kHz - good balance
-const PLAYBACK_BUFFER_MS: usize = 200;  // 200ms buffer - stable latency
+// Playback buffer in milliseconds. Lower values reduce latency but increase
+// risk of underruns. Default to 80ms as a reasonable balance for Raspberry Pi 5.
+const PLAYBACK_BUFFER_MS: usize = 80;  // 80ms buffer - lower latency
 
 /// Audio Manager - handles both capture and playback
 pub struct AudioManager {

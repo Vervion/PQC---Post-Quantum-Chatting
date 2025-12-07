@@ -64,6 +64,7 @@ parking_lot = "0.12"
 cpal = "0.15"  # Cross-platform audio I/O
 rubato = "0.14"  # Sample rate conversion
 ringbuf = "0.3"  # Lock-free ring buffer for audio
+opus = "0.3"  # Opus audio codec for compression
 
 # Config parsing
 toml = "0.8"
