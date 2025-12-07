@@ -26,8 +26,8 @@ pub enum AudioError {
 
 const SAMPLE_RATE: u32 = 48000;  // 48kHz standard audio
 const CHANNELS: u16 = 1;  // Mono audio
-const BUFFER_SIZE: usize = 240;  // 5ms at 48kHz - very low latency
-const PLAYBACK_BUFFER_MS: usize = 60;  // 60ms buffer - minimal jitter tolerance
+const BUFFER_SIZE: usize = 960;  // 20ms at 48kHz - stable chunk size
+const PLAYBACK_BUFFER_MS: usize = 200;  // 200ms buffer - handles network jitter
 
 /// Audio Manager - handles both capture and playback
 pub struct AudioManager {
@@ -109,16 +109,13 @@ impl AudioManager {
         let stream = device.build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // For ultra-low latency: send data as soon as we get any
-                // Don't wait to accumulate a full buffer
-                for sample in data {
-                    audio_buffer.push(*sample);
-                    
-                    // Send when we have minimum viable packet size
-                    if audio_buffer.len() >= BUFFER_SIZE {
-                        let chunk: Vec<f32> = audio_buffer.drain(..BUFFER_SIZE).collect();
-                        callback(chunk);
-                    }
+                // Accumulate complete buffers to prevent fragmentation
+                audio_buffer.extend_from_slice(data);
+                
+                // Send complete chunks only to reduce network packets and improve quality
+                while audio_buffer.len() >= BUFFER_SIZE {
+                    let chunk: Vec<f32> = audio_buffer.drain(..BUFFER_SIZE).collect();
+                    callback(chunk);
                 }
             },
             |err| {
@@ -158,8 +155,11 @@ impl AudioManager {
         let ring_buffer = HeapRb::<f32>::new(buffer_samples); 
         let (mut producer, mut consumer) = ring_buffer.split();
         
-        // NO prefill - start immediately to minimize latency
-        // First packet may glitch but subsequent audio will be real-time
+        // Prefill buffer with silence to prevent initial glitches
+        let prefill_samples = buffer_samples / 4; // 50ms prefill
+        for _ in 0..prefill_samples {
+            let _ = producer.push(0.0);
+        }
         
         let stream = device.build_output_stream(
             &config,
@@ -217,6 +217,15 @@ impl AudioManager {
     /// Check if playback is active
     pub fn is_playing(&self) -> bool {
         self.output_stream.is_some()
+    }
+    
+    /// Clear audio buffers (useful when ending calls to prevent delayed audio)
+    pub fn clear_buffers(&mut self) {
+        // Restart playback stream to clear ring buffer
+        if self.is_playing() {
+            self.stop_playback();
+            // Note: Producer will need to be recreated after this
+        }
     }
 }
 

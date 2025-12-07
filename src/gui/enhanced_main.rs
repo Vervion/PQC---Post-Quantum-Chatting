@@ -404,15 +404,9 @@ impl EnhancedPqcChatApp {
                     self.add_status_message(message);
                 },
                 GuiUpdate::AudioDataReceived { sender_id, data } => {
-                    // Play received audio data
+                    // Play received audio data with proper buffer management
                     if let Some(producer) = &self.audio_producer {
-                        // AGGRESSIVE LATENCY CONTROL: Drop every 3rd packet to prevent buildup
-                        // This trades quality for latency
                         self.audio_packet_counter += 1;
-                        if self.audio_packet_counter % 3 == 0 {
-                            eprintln!("WARNING: Dropping packet #{} to maintain low latency", self.audio_packet_counter);
-                            return;
-                        }
                         
                         let samples = pqc_chat::audio::bytes_to_samples(&data);
                         let num_samples = samples.len();
@@ -422,18 +416,32 @@ impl EnhancedPqcChatApp {
                         
                         let mut producer = producer.lock().unwrap();
                         
-                        // Try to push all samples
+                        // Check buffer status and implement adaptive buffer management
+                        let buffer_free_space = producer.free_len();
+                        let buffer_used_space = producer.len();
+                        let total_capacity = buffer_free_space + buffer_used_space;
+                        let buffer_usage_percent = (buffer_used_space as f32 / total_capacity as f32) * 100.0;
+                        
+                        // If buffer is getting too full (>80%), drop frames to prevent delay buildup
+                        if buffer_usage_percent > 80.0 {
+                            eprintln!("WARNING: Audio buffer {}% full, dropping packet to prevent delay", buffer_usage_percent as u32);
+                            return;
+                        }
+                        
+                        // Push samples to buffer
                         let mut pushed_count = 0;
                         for sample in samples {
                             if producer.push(sample).is_ok() {
                                 pushed_count += 1;
                             } else {
-                                break; // Buffer completely full
+                                break; // Buffer full
                             }
                         }
                         
-                        eprintln!("DEBUG: Audio packet #{}: {} samples, pushed {}, max_amp={:.4}", 
-                                  self.audio_packet_counter, num_samples, pushed_count, max_amplitude);
+                        if self.audio_packet_counter % 50 == 0 { // Log every 50 packets (~1 second)
+                            eprintln!("DEBUG: Audio packet #{}: {} samples, pushed {}, buffer {}%, max_amp={:.4}", 
+                                      self.audio_packet_counter, num_samples, pushed_count, buffer_usage_percent as u32, max_amplitude);
+                        }
                         
                         if pushed_count < num_samples {
                             eprintln!("WARNING: Buffer overflow! Dropped {} samples", num_samples - pushed_count);
@@ -502,6 +510,7 @@ impl EnhancedPqcChatApp {
         }
 
         self.audio_manager = Some(Arc::new(Mutex::new(manager)));
+        self.audio_call_active = true;
         self.add_status_message("🎤 Audio call started - speak now!".to_string());
         log::info!("Audio call started successfully");
     }
@@ -509,15 +518,11 @@ impl EnhancedPqcChatApp {
     fn stop_audio_call(&mut self) {
         log::info!("Stopping audio call...");
         
-        // Clear any buffered audio first
-        if let Some(producer) = &self.audio_producer {
-            let mut producer = producer.lock().unwrap();
-            // Drain all samples from buffer
-            while producer.push(0.0).is_ok() {
-                // Fill with silence to flush old audio
-            }
-            eprintln!("DEBUG: Cleared audio buffer on stop");
-        }
+        // Reset packet counter and clear state
+        self.audio_packet_counter = 0;
+        
+        // Audio buffer will be cleared when manager stops
+        eprintln!("DEBUG: Resetting audio state on stop");
         
         // Stop audio manager
         if let Some(manager_arc) = self.audio_manager.take() {
@@ -528,6 +533,7 @@ impl EnhancedPqcChatApp {
         
         // Clear producer reference
         self.audio_producer = None;
+        self.audio_call_active = false;
         
         self.add_status_message("🔇 Audio call ended".to_string());
         log::info!("Audio call stopped");
