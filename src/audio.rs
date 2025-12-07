@@ -26,8 +26,8 @@ pub enum AudioError {
 
 const SAMPLE_RATE: u32 = 48000;  // 48kHz standard audio
 const CHANNELS: u16 = 1;  // Mono audio
-const BUFFER_SIZE: usize = 240;  // 5ms at 48kHz - very low latency
-const PLAYBACK_BUFFER_MS: usize = 60;  // 60ms buffer - minimal jitter tolerance
+const BUFFER_SIZE: usize = 960;  // 20ms at 48kHz - good balance
+const PLAYBACK_BUFFER_MS: usize = 200;  // 200ms buffer - stable latency
 
 /// Audio Manager - handles both capture and playback
 pub struct AudioManager {

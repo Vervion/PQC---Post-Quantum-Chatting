@@ -126,7 +126,6 @@ struct EnhancedPqcChatApp {
     audio_manager: Option<Arc<Mutex<pqc_chat::audio::AudioManager>>>,
     audio_producer: Option<Arc<Mutex<ringbuf::HeapProducer<f32>>>>,
     audio_send_handle: Option<std::thread::JoinHandle<()>>,
-    audio_packet_counter: u32,  // For aggressive latency control
 
     // Chat state - per room
     room_chat_history: HashMap<String, Vec<ChatMessage>>,  // room_id -> messages
@@ -229,7 +228,6 @@ impl EnhancedPqcChatApp {
             audio_manager: None,
             audio_producer: None,
             audio_send_handle: None,
-            audio_packet_counter: 0,
             show_users_panel: true,
             show_rooms_panel: true,
             users_window_open: true,
@@ -404,16 +402,8 @@ impl EnhancedPqcChatApp {
                     self.add_status_message(message);
                 },
                 GuiUpdate::AudioDataReceived { sender_id, data } => {
-                    // Play received audio data
+                    // Play received audio data with stable buffering
                     if let Some(producer) = &self.audio_producer {
-                        // AGGRESSIVE LATENCY CONTROL: Drop every 3rd packet to prevent buildup
-                        // This trades quality for latency
-                        self.audio_packet_counter += 1;
-                        if self.audio_packet_counter % 3 == 0 {
-                            eprintln!("WARNING: Dropping packet #{} to maintain low latency", self.audio_packet_counter);
-                            return;
-                        }
-                        
                         let samples = pqc_chat::audio::bytes_to_samples(&data);
                         let num_samples = samples.len();
                         
@@ -422,21 +412,22 @@ impl EnhancedPqcChatApp {
                         
                         let mut producer = producer.lock().unwrap();
                         
-                        // Try to push all samples
+                        // Push all samples to buffer - let the playback handle underruns
                         let mut pushed_count = 0;
                         for sample in samples {
                             if producer.push(sample).is_ok() {
                                 pushed_count += 1;
                             } else {
-                                break; // Buffer completely full
+                                // Buffer full - skip remaining samples this packet
+                                break;
                             }
                         }
                         
-                        eprintln!("DEBUG: Audio packet #{}: {} samples, pushed {}, max_amp={:.4}", 
-                                  self.audio_packet_counter, num_samples, pushed_count, max_amplitude);
+                        eprintln!("DEBUG: Audio from {}: {} samples, pushed {}, max_amp={:.4}", 
+                                  sender_id, num_samples, pushed_count, max_amplitude);
                         
                         if pushed_count < num_samples {
-                            eprintln!("WARNING: Buffer overflow! Dropped {} samples", num_samples - pushed_count);
+                            eprintln!("WARNING: Buffer full, dropped {} samples", num_samples - pushed_count);
                         }
                     } else {
                         eprintln!("DEBUG: Received audio but no producer (call not started?)");
