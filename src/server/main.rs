@@ -171,8 +171,8 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // CRITICAL: Create BOUNDED message channel to prevent 50s audio delays
-    // Small buffer forces packet dropping instead of unlimited queuing
-    let (message_tx, mut message_rx) = mpsc::channel(16); // Max 16 queued messages
+    // Moderate buffer allows some queuing but prevents infinite buildup
+    let (message_tx, mut message_rx) = mpsc::channel(64); // Max 64 queued messages
     
     let client_state = Arc::new(RwLock::new(ClientState::new(message_tx)));
     let participant_id = client_state.read().participant_id.clone();

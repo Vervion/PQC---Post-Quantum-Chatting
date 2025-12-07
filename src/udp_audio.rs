@@ -73,6 +73,7 @@ impl UdpAudioServer {
 }
 
 /// UDP Audio Client - sends audio streams  
+#[derive(Debug)]
 pub struct UdpAudioClient {
     socket: Arc<UdpSocket>,
     server_addr: SocketAddr,

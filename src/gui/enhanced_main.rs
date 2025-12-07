@@ -175,6 +175,7 @@ enum GuiCommand {
     StopAudioCall,
     SendAudioData { data: Vec<u8> },
     SendUdpAudioData { data: Vec<u8> },  // Ultra-low latency UDP audio
+    InitializeUdpAudio { host: String, port: u16 },  // Initialize UDP audio client
 }
 
 #[cfg(feature = "gui")]
@@ -199,6 +200,7 @@ enum GuiUpdate {
     StatusMessage { message: String },
     // Audio functionality
     AudioDataReceived { sender_id: String, data: Vec<u8> },
+    UdpAudioClientReady { client: pqc_chat::udp_audio::UdpAudioClient },
 }
 
 #[cfg(feature = "gui")]
@@ -250,7 +252,7 @@ impl EnhancedPqcChatApp {
             // Initialize UDP audio components
             udp_audio_client: None,
             real_time_buffer: RealTimeAudioBuffer::new(150), // 150ms max buffer age
-            use_udp_audio: true,  // Default to UDP for low latency
+            use_udp_audio: false,  // Temporarily disable UDP until fully integrated
             show_users_panel: true,
             show_rooms_panel: true,
             users_window_open: true,
@@ -425,6 +427,7 @@ impl EnhancedPqcChatApp {
                     self.add_status_message(message);
                 },
                 GuiUpdate::AudioDataReceived { sender_id, data } => {
+                    eprintln!("DEBUG: Received {} bytes of audio data from {}", data.len(), sender_id);
                     // ULTRA-LOW LATENCY AUDIO: Immediate processing with aggressive buffer management
                     if let Some(producer) = &self.audio_producer {
                         self.audio_packet_counter += 1;
@@ -512,6 +515,13 @@ impl EnhancedPqcChatApp {
                         eprintln!("DEBUG: Received audio but no producer (call not started?)");
                     }
                 },
+                GuiUpdate::UdpAudioClientReady { client } => {
+                    eprintln!("DEBUG: UDP audio client ready and connected");
+                    self.udp_audio_client = Some(client);
+                    // Initialize real-time buffer for UDP mode
+                    self.real_time_buffer = pqc_chat::udp_audio::RealTimeAudioBuffer::new(150); // 150ms max age
+                    self.add_status_message("🚀 UDP audio client connected - ultra-low latency mode!".to_string());
+                },
             }
         }
     }
@@ -552,19 +562,53 @@ impl EnhancedPqcChatApp {
         };
         self.audio_producer = Some(producer);
 
+        // Initialize UDP audio client if using UDP mode
+        if self.use_udp_audio {
+            // Extract host and port from current connection
+            if !self.server_host.is_empty() {
+                let host = self.server_host.clone();
+                let port: u16 = self.server_port.parse().unwrap_or(8443);
+                let udp_port = port + 1; // UDP audio server is on port+1
+                
+                // Send command to initialize UDP client asynchronously
+                eprintln!("DEBUG: Requesting UDP audio client initialization for {}:{}", host, udp_port);
+                if let Some(ref sender) = self.command_sender {
+                    let _ = sender.send(GuiCommand::InitializeUdpAudio { host, port: udp_port });
+                }
+            } else {
+                self.add_status_message("❌ No server connection for UDP audio".to_string());
+                return;
+            }
+        }
+
         // Start capture with callback - always use command sender for now
         let command_sender = self.command_sender.clone();
         let use_udp = self.use_udp_audio;
+        let udp_client = self.udp_audio_client.clone();
         
         let capture_result = manager.start_capture(move |samples| {
             // Convert samples to bytes
             let bytes = pqc_chat::audio::samples_to_bytes(&samples);
+            eprintln!("DEBUG: Captured {} samples -> {} bytes, UDP mode: {}", samples.len(), bytes.len(), use_udp);
             
-            // Send through command system (will be routed to UDP or TCP)
-            if let Some(sender) = &command_sender {
-                if use_udp {
-                    let _ = sender.send(GuiCommand::SendUdpAudioData { data: bytes });
+            // Send through appropriate channel (UDP direct or TCP via command system)
+            if use_udp {
+                // Send directly via UDP client for ultra-low latency
+                if let Some(client) = &udp_client {
+                    // Use tokio to spawn async task for UDP sending
+                    let client_clone = client.clone();
+                    let bytes_clone = bytes.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = client_clone.send_audio_chunk(bytes_clone).await {
+                            eprintln!("ERROR: Failed to send UDP audio data: {}", e);
+                        }
+                    });
                 } else {
+                    eprintln!("ERROR: UDP client not initialized but UDP mode enabled");
+                }
+            } else {
+                // Send through TCP command system
+                if let Some(sender) = &command_sender {
                     let _ = sender.send(GuiCommand::SendAudioData { data: bytes });
                 }
             }
@@ -1284,13 +1328,49 @@ async fn handle_command(
         },
         GuiCommand::SendAudioData { data } => {
             // Send audio data through signaling
+            eprintln!("DEBUG: Sending {} bytes of audio data via TCP", data.len());
             let msg = SignalingMessage::AudioData { data };
             send_message(stream, &msg).await?;
             // Audio data doesn't need response
             return Ok(());
         },
+        GuiCommand::SendUdpAudioData { data } => {
+            eprintln!("DEBUG: Sending {} bytes of audio data via UDP (bypassing TCP)", data.len());
+            // UDP audio data is handled directly by the UDP client - no TCP signaling needed
+            // The UDP client should be initialized and sending data directly to server
+            return Ok(());
+        },
         GuiCommand::StartAudioCall | GuiCommand::StopAudioCall => {
             // These are handled locally in the GUI
+            return Ok(());
+        },
+        GuiCommand::InitializeUdpAudio { host, port } => {
+            eprintln!("DEBUG: Initializing UDP audio client for {}:{}", host, port);
+            let server_addr = format!("{}:{}", host, port).parse::<std::net::SocketAddr>();
+            match server_addr {
+                Ok(addr) => {
+                    // Generate a session ID based on username (we'll use a simple UUID for now)
+                    let session_id = uuid::Uuid::new_v4().to_string();
+                    match pqc_chat::udp_audio::UdpAudioClient::new(addr, session_id).await {
+                        Ok(udp_client) => {
+                            eprintln!("DEBUG: UDP audio client successfully connected to {}:{}", host, port);
+                            let _ = update_sender.send(GuiUpdate::UdpAudioClientReady { client: udp_client });
+                        }
+                        Err(e) => {
+                            eprintln!("ERROR: Failed to initialize UDP audio client: {}", e);
+                            let _ = update_sender.send(GuiUpdate::ConnectionError { 
+                                error: format!("UDP audio client failed: {}", e) 
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("ERROR: Invalid server address {}:{}: {}", host, port, e);
+                    let _ = update_sender.send(GuiUpdate::ConnectionError { 
+                        error: format!("Invalid server address: {}", e) 
+                    });
+                }
+            }
             return Ok(());
         },
         _ => return Ok(()),
