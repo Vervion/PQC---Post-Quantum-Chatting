@@ -19,6 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use pqc_chat::crypto::kyber::KyberKeyExchange;
 #[cfg(feature = "gui")]
 use pqc_chat::protocol::{ParticipantInfo, RoomInfo, SignalingMessage};
+#[cfg(feature = "gui")]
+use pqc_chat::udp_audio::{UdpAudioClient, RealTimeAudioBuffer};
 
 // Helper function for formatting timestamps
 fn format_time(time: std::time::SystemTime) -> String {
@@ -129,6 +131,13 @@ struct EnhancedPqcChatApp {
     audio_packet_counter: u32,  // For aggressive latency control
     last_buffer_reset: std::time::SystemTime,  // Track when we last reset buffers
     consecutive_high_buffer: u32,  // Count of high buffer usage events
+    buffer_usage: f32,  // Current buffer usage percentage
+    estimated_latency_ms: usize,  // Estimated audio latency in milliseconds
+    
+    // UDP Audio for ultra-low latency streaming
+    udp_audio_client: Option<UdpAudioClient>,
+    real_time_buffer: RealTimeAudioBuffer,
+    use_udp_audio: bool,  // Toggle between TCP and UDP audio
 
     // Chat state - per room
     room_chat_history: HashMap<String, Vec<ChatMessage>>,  // room_id -> messages
@@ -165,6 +174,7 @@ enum GuiCommand {
     StartAudioCall,
     StopAudioCall,
     SendAudioData { data: Vec<u8> },
+    SendUdpAudioData { data: Vec<u8> },  // Ultra-low latency UDP audio
 }
 
 #[cfg(feature = "gui")]
@@ -234,6 +244,13 @@ impl EnhancedPqcChatApp {
             audio_packet_counter: 0,
             last_buffer_reset: std::time::SystemTime::now(),
             consecutive_high_buffer: 0,
+            buffer_usage: 0.0,
+            estimated_latency_ms: 0,
+            
+            // Initialize UDP audio components
+            udp_audio_client: None,
+            real_time_buffer: RealTimeAudioBuffer::new(150), // 150ms max buffer age
+            use_udp_audio: true,  // Default to UDP for low latency
             show_users_panel: true,
             show_rooms_panel: true,
             users_window_open: true,
@@ -408,84 +425,89 @@ impl EnhancedPqcChatApp {
                     self.add_status_message(message);
                 },
                 GuiUpdate::AudioDataReceived { sender_id, data } => {
-                    // Play received audio data with proper buffer management
+                    // ULTRA-LOW LATENCY AUDIO: Immediate processing with aggressive buffer management
                     if let Some(producer) = &self.audio_producer {
                         self.audio_packet_counter += 1;
                         
                         let samples = pqc_chat::audio::bytes_to_samples(&data);
-                        let num_samples = samples.len();
-                        
-                        // Calculate audio statistics
-                        let max_amplitude = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-                        
                         let mut producer = producer.lock().unwrap();
                         
-                        // AGGRESSIVE LATENCY CONTROL - Multiple strategies
+                        // CRITICAL: Real-time buffer analysis
                         let buffer_free_space = producer.free_len();
                         let buffer_used_space = producer.len();
                         let total_capacity = buffer_free_space + buffer_used_space;
                         let buffer_usage_percent = (buffer_used_space as f32 / total_capacity as f32) * 100.0;
                         
-                        // Strategy 1: Progressive packet dropping based on call duration
-                        let call_duration_secs = self.audio_packet_counter / 100; // ~100 packets per second
-                        let drop_threshold = if call_duration_secs < 30 {
-                            70.0  // First 30 seconds: 70% threshold
-                        } else if call_duration_secs < 120 {
-                            60.0  // Next 90 seconds: 60% threshold  
-                        } else {
-                            50.0  // After 2 minutes: 50% threshold (very aggressive)
-                        };
+                        // STRATEGY: Maintain <100ms of buffered audio (4800 samples at 48kHz)
+                        let max_latency_samples = 4800; // 100ms maximum buffer
+                        let emergency_threshold = 2400; // 50ms - start aggressive clearing
                         
-                        if buffer_usage_percent > drop_threshold {
-                            self.consecutive_high_buffer += 1;
-                            eprintln!("WARNING: Buffer {}% (threshold {}%), dropping packet #{}", 
-                                     buffer_usage_percent as u32, drop_threshold as u32, self.audio_packet_counter);
-                            return;
-                        } else {
-                            self.consecutive_high_buffer = 0;
-                        }
-                        
-                        // Strategy 2: Periodic buffer reset during long calls
-                        let time_since_reset = std::time::SystemTime::now()
-                            .duration_since(self.last_buffer_reset)
-                            .unwrap_or_default()
-                            .as_secs();
+                        // EMERGENCY: Buffer too full - drain old audio immediately
+                        if buffer_used_space > max_latency_samples {
+                            let samples_to_drain = buffer_used_space - emergency_threshold;
+                            eprintln!("EMERGENCY: Draining {} samples to prevent {}ms latency", 
+                                     samples_to_drain, (buffer_used_space * 1000) / 48000);
                             
-                        if time_since_reset > 45 && self.consecutive_high_buffer > 5 {
-                            eprintln!("RESET: Buffer reset after {}s due to persistent high usage", time_since_reset);
-                            // Force buffer reset by temporarily blocking packets
-                            // Note: In a real implementation, we'd coordinate with the consumer
-                            // For now, we'll rely on packet dropping to reduce buffer size
-                            self.last_buffer_reset = std::time::SystemTime::now();
-                            self.consecutive_high_buffer = 0;
-                        }
-                        
-                        // Strategy 3: Quality-based dropping for longer calls
-                        if call_duration_secs > 60 && self.audio_packet_counter % 4 == 0 && buffer_usage_percent > 40.0 {
-                            // Drop every 4th packet after 1 minute if buffer > 40%
-                            eprintln!("QUALITY: Dropping packet #{} for long call latency control", self.audio_packet_counter);
-                            return;
-                        }
-                        
-                        // Push samples to buffer
-                        let mut pushed_count = 0;
-                        for sample in samples {
-                            if producer.push(sample).is_ok() {
-                                pushed_count += 1;
-                            } else {
-                                break; // Buffer full
+                            // Since we can't access consumer here, we'll clear space by not adding new data
+                            // and relying on the consumer to drain the existing buffer
+                            self.consecutive_high_buffer += 1;
+                            
+                            // Only process every Nth packet when buffer is critically full
+                            if self.audio_packet_counter % 3 != 0 {
+                                return; // Skip this packet to let buffer drain
                             }
                         }
                         
-                        if self.audio_packet_counter % 100 == 0 { // Log every 100 packets (~1 second)
-                            eprintln!("DEBUG: Packet #{} ({}s): {}% buffer, {}ms call, drop_thresh={}%", 
-                                      self.audio_packet_counter, call_duration_secs, buffer_usage_percent as u32, 
-                                      time_since_reset, drop_threshold as u32);
+                        // AGGRESSIVE: Even moderate buffer usage triggers packet skipping
+                        if buffer_usage_percent > 25.0 {
+                            self.consecutive_high_buffer += 1;
+                            // Skip 50% of packets when buffer > 25% to prevent buildup
+                            if self.audio_packet_counter % 2 == 0 {
+                                return;
+                            }
+                        } else {
+                            self.consecutive_high_buffer = 0;
                         }
                         
-                        if pushed_count < num_samples {
-                            eprintln!("WARNING: Buffer overflow! Dropped {} samples", num_samples - pushed_count);
+                        // FORCE IMMEDIATE PROCESSING: Add samples but prefer recent data
+                        let mut samples_added = 0;
+                        
+                        // If buffer is getting full, only add the most recent part of the packet
+                        let samples_to_add = if buffer_usage_percent > 15.0 {
+                            // When buffer > 15%, only take last 50% of packet (most recent audio)
+                            let start_idx = samples.len() / 2;
+                            &samples[start_idx..]
+                        } else {
+                            // Normal case: add entire packet
+                            &samples
+                        };
+                        
+                        for &sample in samples_to_add {
+                            match producer.push(sample) {
+                                Ok(_) => samples_added += 1,
+                                Err(_) => {
+                                    // Buffer full - this should not happen with our aggressive management
+                                    eprintln!("CRITICAL: Buffer completely full despite aggressive management!");
+                                    break;
+                                }
+                            }
                         }
+                        
+                        // Real-time diagnostic logging
+                        if self.audio_packet_counter % 50 == 0 { // Every ~500ms
+                            let estimated_latency_ms = (buffer_used_space * 1000) / 48000;
+                            eprintln!("REALTIME: Pkt#{} | Buffer: {}% ({} samples, ~{}ms latency) | Added: {}/{}", 
+                                      self.audio_packet_counter, 
+                                      buffer_usage_percent as u32, 
+                                      buffer_used_space,
+                                      estimated_latency_ms,
+                                      samples_added, 
+                                      samples_to_add.len());
+                        }
+                        
+                        // Update buffer metrics for GUI display  
+                        self.buffer_usage = buffer_usage_percent;
+                        self.estimated_latency_ms = (buffer_used_space * 1000) / 48000;
                     } else {
                         eprintln!("DEBUG: Received audio but no producer (call not started?)");
                     }
@@ -530,15 +552,21 @@ impl EnhancedPqcChatApp {
         };
         self.audio_producer = Some(producer);
 
-        // Start capture with callback
+        // Start capture with callback - always use command sender for now
         let command_sender = self.command_sender.clone();
+        let use_udp = self.use_udp_audio;
+        
         let capture_result = manager.start_capture(move |samples| {
             // Convert samples to bytes
             let bytes = pqc_chat::audio::samples_to_bytes(&samples);
             
-            // Send to server
+            // Send through command system (will be routed to UDP or TCP)
             if let Some(sender) = &command_sender {
-                let _ = sender.send(GuiCommand::SendAudioData { data: bytes });
+                if use_udp {
+                    let _ = sender.send(GuiCommand::SendUdpAudioData { data: bytes });
+                } else {
+                    let _ = sender.send(GuiCommand::SendAudioData { data: bytes });
+                }
             }
         });
 
@@ -868,6 +896,21 @@ impl eframe::App for EnhancedPqcChatApp {
                         
                         ui.separator();
                         
+                        // Audio transport mode toggle
+                        ui.horizontal(|ui| {
+                            ui.label("Audio Mode:");
+                            if ui.selectable_label(self.use_udp_audio, "🚀 UDP (Ultra-Low Latency)").clicked() {
+                                self.use_udp_audio = true;
+                                self.add_status_message("Switched to UDP audio mode".to_string());
+                            }
+                            if ui.selectable_label(!self.use_udp_audio, "📡 TCP (Reliable)").clicked() {
+                                self.use_udp_audio = false;
+                                self.add_status_message("Switched to TCP audio mode".to_string());
+                            }
+                        });
+                        
+                        ui.separator();
+                        
                         // Audio call control
                         if self.audio_call_active {
                             if ui.button("📞 End Call").on_hover_text("Stop audio call").clicked() {
@@ -883,6 +926,27 @@ impl eframe::App for EnhancedPqcChatApp {
                         
                         ui.separator();
                         ui.label(format!("👥 {} participants", self.room_participants.len()));
+                        
+                        // REAL-TIME BUFFER MONITORING (when in audio call)
+                        if self.audio_call_active {
+                            ui.separator();
+                            let buffer_color = if self.buffer_usage > 50.0 {
+                                egui::Color32::RED
+                            } else if self.buffer_usage > 25.0 {
+                                egui::Color32::YELLOW
+                            } else {
+                                egui::Color32::GREEN
+                            };
+                            
+                            ui.colored_label(buffer_color, 
+                                format!("🔊 Buffer: {:.0}% (~{}ms latency)", 
+                                       self.buffer_usage, self.estimated_latency_ms));
+                            
+                            if self.consecutive_high_buffer > 0 {
+                                ui.colored_label(egui::Color32::from_rgb(255, 165, 0),
+                                    format!("⚠️ High buffer events: {}", self.consecutive_high_buffer));
+                            }
+                        }
                     });
                     
                     ui.separator();

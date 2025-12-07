@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use clap::Parser;
-use log::{error, info};
+use log::{error, info, warn};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -21,6 +21,7 @@ use pqc_chat::crypto::kyber::KyberKeyExchange;
 use pqc_chat::media::MediaForwarder;
 use pqc_chat::protocol::{ParticipantInfo, RoomInfo, ServerUserInfo, SignalingMessage};
 use pqc_chat::room::{Participant, RoomManager};
+use pqc_chat::udp_audio::{UdpAudioServer, UdpAudioPacket};
 use pqc_chat::ServerConfig;
 
 /// Command-line arguments
@@ -50,11 +51,11 @@ struct ClientState {
     participant_id: String,
     username: Option<String>,
     shared_secret: Option<Vec<u8>>,
-    message_tx: mpsc::UnboundedSender<SignalingMessage>,
+    message_tx: mpsc::Sender<SignalingMessage>,  // CRITICAL: Bounded to prevent queuing
 }
 
 impl ClientState {
-    fn new(message_tx: mpsc::UnboundedSender<SignalingMessage>) -> Self {
+    fn new(message_tx: mpsc::Sender<SignalingMessage>) -> Self {
         Self {
             participant_id: Uuid::new_v4().to_string(),
             username: None,
@@ -121,6 +122,22 @@ async fn main() -> Result<()> {
     let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
     let listener = TcpListener::bind(addr).await?;
     info!("PQC Chat Server listening on {}", addr);
+    
+    // Start UDP audio server for low-latency streaming (port+1)
+    let udp_port = port + 1;
+    let (udp_audio_tx, mut udp_audio_rx) = mpsc::unbounded_channel();
+    let udp_server = UdpAudioServer::new(udp_port).await?;
+    udp_server.start(udp_audio_tx).await?;
+    info!("🎵 UDP Audio Server listening on 0.0.0.0:{}", udp_port);
+    
+    // Handle UDP audio packets in background
+    let state_udp = state.clone();
+    tokio::spawn(async move {
+        while let Some((src, packet)) = udp_audio_rx.recv().await {
+            // Forward UDP audio packets to appropriate clients
+            handle_udp_audio_packet(src, packet, &state_udp).await;
+        }
+    });
 
     // Accept connections
     loop {
@@ -153,8 +170,9 @@ async fn handle_client<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    // Create message channel for broadcasting to this client
-    let (message_tx, mut message_rx) = mpsc::unbounded_channel();
+    // CRITICAL: Create BOUNDED message channel to prevent 50s audio delays
+    // Small buffer forces packet dropping instead of unlimited queuing
+    let (message_tx, mut message_rx) = mpsc::channel(16); // Max 16 queued messages
     
     let client_state = Arc::new(RwLock::new(ClientState::new(message_tx)));
     let participant_id = client_state.read().participant_id.clone();
@@ -211,7 +229,7 @@ where
                     
                     // Send response through the client's message channel
                     if let Some(client) = state.clients.read().get(&participant_id) {
-                        let _ = client.read().message_tx.send(response);
+                        let _ = client.read().message_tx.try_send(response);
                     }
                 }
                 Err(e) => {
@@ -220,7 +238,7 @@ where
                         message: "Invalid message format".to_string(),
                     };
                     if let Some(client) = state.clients.read().get(&participant_id) {
-                        let _ = client.read().message_tx.send(error_msg);
+                        let _ = client.read().message_tx.try_send(error_msg);
                     }
                 }
             }
@@ -476,8 +494,8 @@ async fn handle_message(
                     data,
                 };
                 
-                // Broadcast to all other participants in the room (excluding sender)
-                broadcast_to_room(&state, &room_id, participant_id, audio_message).await;
+                // CRITICAL: Use audio-specific broadcast with queue management
+                broadcast_audio_to_room(&state, &room_id, participant_id, audio_message).await;
             }
             
             // No response needed for audio data
@@ -507,6 +525,43 @@ fn load_key(path: &PathBuf) -> Result<PrivateKeyDer<'static>> {
 }
 
 /// Broadcast a message to all participants in a room except the sender
+// CRITICAL: Audio-specific broadcast with aggressive queue management
+async fn broadcast_audio_to_room(
+    state: &Arc<ServerState>, 
+    room_id: &str, 
+    sender_id: &str, 
+    message: SignalingMessage
+) {
+    if let Some(room) = state.room_manager.get_room(room_id) {
+        let participant_ids = room.get_participant_ids();
+        let clients = state.clients.read();
+        
+        info!("Broadcasting audio to room {} (except sender {})", room_id, sender_id);
+        info!("Participants in room: {:?}", participant_ids);
+        
+        for participant_id in participant_ids {
+            // Don't send to the sender
+            if participant_id != sender_id {
+                if let Some(client_state) = clients.get(&participant_id) {
+                    let tx = &client_state.read().message_tx;
+                    
+                    // CRITICAL: Use try_send for bounded channels - auto-drops if full
+                    info!("Sending audio to participant {} (bounded queue prevents buildup)", participant_id);
+                    
+                    // Try non-blocking send for audio - drop if would block
+                    if let Err(e) = tx.try_send(message.clone()) {
+                        warn!("Audio packet dropped for {}: {:?} (prevents latency buildup)", participant_id, e);
+                    }
+                } else {
+                    info!("Client {} not found in clients map", participant_id);
+                }
+            }
+        }
+    } else {
+        info!("Room {} not found for broadcast", room_id);
+    }
+}
+
 async fn broadcast_to_room(
     state: &Arc<ServerState>, 
     room_id: &str, 
@@ -525,7 +580,7 @@ async fn broadcast_to_room(
             if participant_id != sender_id {
                 if let Some(client_state) = clients.get(&participant_id) {
                     info!("Sending broadcast to participant {}", participant_id);
-                    if let Err(e) = client_state.read().message_tx.send(message.clone()) {
+                    if let Err(e) = client_state.read().message_tx.try_send(message.clone()) {
                         error!("Failed to send broadcast to {}: {}", participant_id, e);
                     }
                 } else {
@@ -539,6 +594,33 @@ async fn broadcast_to_room(
 }
 
 /// Broadcast a message to all participants in a room including the sender
+/// Handle incoming UDP audio packets - ULTRA LOW LATENCY
+async fn handle_udp_audio_packet(
+    _src: SocketAddr,
+    packet: UdpAudioPacket, 
+    state: &Arc<ServerState>
+) {
+    // Find the session/room based on session_id
+    // For now, broadcast to all clients in all rooms (can optimize later)
+    let clients = state.clients.read();
+    
+    // Convert UDP packet back to TCP SignalingMessage format for compatibility
+    let audio_message = SignalingMessage::AudioDataReceived {
+        sender_id: packet.session_id.clone(),
+        data: packet.audio_data,
+    };
+    
+    // Broadcast to all other clients (excluding sender)
+    for (client_id, client_state) in clients.iter() {
+        if client_id != &packet.session_id {
+            // Use try_send for UDP audio - drop if queue full (prevents buildup)
+            if let Err(_) = client_state.read().message_tx.try_send(audio_message.clone()) {
+                // Silently drop - this is expected behavior for UDP audio
+            }
+        }
+    }
+}
+
 async fn broadcast_to_room_all(
     state: &Arc<ServerState>, 
     room_id: &str, 
@@ -554,7 +636,7 @@ async fn broadcast_to_room_all(
         for participant_id in participant_ids {
             if let Some(client_state) = clients.get(&participant_id) {
                 info!("Sending broadcast to participant {}", participant_id);
-                if let Err(e) = client_state.read().message_tx.send(message.clone()) {
+                if let Err(e) = client_state.read().message_tx.try_send(message.clone()) {
                     error!("Failed to send broadcast to {}: {}", participant_id, e);
                 }
             } else {
