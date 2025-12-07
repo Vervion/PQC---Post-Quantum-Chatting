@@ -127,6 +127,8 @@ struct EnhancedPqcChatApp {
     audio_producer: Option<Arc<Mutex<ringbuf::HeapProducer<f32>>>>,
     audio_send_handle: Option<std::thread::JoinHandle<()>>,
     audio_packet_counter: u32,  // For aggressive latency control
+    last_buffer_reset: std::time::SystemTime,  // Track when we last reset buffers
+    consecutive_high_buffer: u32,  // Count of high buffer usage events
 
     // Chat state - per room
     room_chat_history: HashMap<String, Vec<ChatMessage>>,  // room_id -> messages
@@ -230,6 +232,8 @@ impl EnhancedPqcChatApp {
             audio_producer: None,
             audio_send_handle: None,
             audio_packet_counter: 0,
+            last_buffer_reset: std::time::SystemTime::now(),
+            consecutive_high_buffer: 0,
             show_users_panel: true,
             show_rooms_panel: true,
             users_window_open: true,
@@ -416,15 +420,51 @@ impl EnhancedPqcChatApp {
                         
                         let mut producer = producer.lock().unwrap();
                         
-                        // Check buffer status and implement adaptive buffer management
+                        // AGGRESSIVE LATENCY CONTROL - Multiple strategies
                         let buffer_free_space = producer.free_len();
                         let buffer_used_space = producer.len();
                         let total_capacity = buffer_free_space + buffer_used_space;
                         let buffer_usage_percent = (buffer_used_space as f32 / total_capacity as f32) * 100.0;
                         
-                        // If buffer is getting too full (>80%), drop frames to prevent delay buildup
-                        if buffer_usage_percent > 80.0 {
-                            eprintln!("WARNING: Audio buffer {}% full, dropping packet to prevent delay", buffer_usage_percent as u32);
+                        // Strategy 1: Progressive packet dropping based on call duration
+                        let call_duration_secs = self.audio_packet_counter / 100; // ~100 packets per second
+                        let drop_threshold = if call_duration_secs < 30 {
+                            70.0  // First 30 seconds: 70% threshold
+                        } else if call_duration_secs < 120 {
+                            60.0  // Next 90 seconds: 60% threshold  
+                        } else {
+                            50.0  // After 2 minutes: 50% threshold (very aggressive)
+                        };
+                        
+                        if buffer_usage_percent > drop_threshold {
+                            self.consecutive_high_buffer += 1;
+                            eprintln!("WARNING: Buffer {}% (threshold {}%), dropping packet #{}", 
+                                     buffer_usage_percent as u32, drop_threshold as u32, self.audio_packet_counter);
+                            return;
+                        } else {
+                            self.consecutive_high_buffer = 0;
+                        }
+                        
+                        // Strategy 2: Periodic buffer reset during long calls
+                        let time_since_reset = std::time::SystemTime::now()
+                            .duration_since(self.last_buffer_reset)
+                            .unwrap_or_default()
+                            .as_secs();
+                            
+                        if time_since_reset > 45 && self.consecutive_high_buffer > 5 {
+                            eprintln!("RESET: Buffer reset after {}s due to persistent high usage", time_since_reset);
+                            // Force buffer reset by clearing current buffer
+                            while producer.len() > total_capacity / 4 { // Keep only 25% of buffer
+                                let _ = producer.pop();
+                            }
+                            self.last_buffer_reset = std::time::SystemTime::now();
+                            self.consecutive_high_buffer = 0;
+                        }
+                        
+                        // Strategy 3: Quality-based dropping for longer calls
+                        if call_duration_secs > 60 && self.audio_packet_counter % 4 == 0 && buffer_usage_percent > 40.0 {
+                            // Drop every 4th packet after 1 minute if buffer > 40%
+                            eprintln!("QUALITY: Dropping packet #{} for long call latency control", self.audio_packet_counter);
                             return;
                         }
                         
@@ -438,9 +478,10 @@ impl EnhancedPqcChatApp {
                             }
                         }
                         
-                        if self.audio_packet_counter % 50 == 0 { // Log every 50 packets (~1 second)
-                            eprintln!("DEBUG: Audio packet #{}: {} samples, pushed {}, buffer {}%, max_amp={:.4}", 
-                                      self.audio_packet_counter, num_samples, pushed_count, buffer_usage_percent as u32, max_amplitude);
+                        if self.audio_packet_counter % 100 == 0 { // Log every 100 packets (~1 second)
+                            eprintln!("DEBUG: Packet #{} ({}s): {}% buffer, {}ms call, drop_thresh={}%", 
+                                      self.audio_packet_counter, call_duration_secs, buffer_usage_percent as u32, 
+                                      time_since_reset, drop_threshold as u32);
                         }
                         
                         if pushed_count < num_samples {
@@ -518,11 +559,12 @@ impl EnhancedPqcChatApp {
     fn stop_audio_call(&mut self) {
         log::info!("Stopping audio call...");
         
-        // Reset packet counter and clear state
+        // Reset all audio state
         self.audio_packet_counter = 0;
+        self.last_buffer_reset = std::time::SystemTime::now();
+        self.consecutive_high_buffer = 0;
         
-        // Audio buffer will be cleared when manager stops
-        eprintln!("DEBUG: Resetting audio state on stop");
+        eprintln!("DEBUG: Resetting all audio state on stop");
         
         // Stop audio manager
         if let Some(manager_arc) = self.audio_manager.take() {

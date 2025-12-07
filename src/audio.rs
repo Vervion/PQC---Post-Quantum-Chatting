@@ -26,8 +26,9 @@ pub enum AudioError {
 
 const SAMPLE_RATE: u32 = 48000;  // 48kHz standard audio
 const CHANNELS: u16 = 1;  // Mono audio
-const BUFFER_SIZE: usize = 960;  // 20ms at 48kHz - stable chunk size
-const PLAYBACK_BUFFER_MS: usize = 200;  // 200ms buffer - handles network jitter
+const BUFFER_SIZE: usize = 480;  // 10ms at 48kHz - ultra-low latency
+const PLAYBACK_BUFFER_MS: usize = 80;  // 80ms buffer - minimal for stability
+const MAX_BUFFER_BUILDUP_MS: usize = 120; // Drop packets if buffer exceeds this
 
 /// Audio Manager - handles both capture and playback
 pub struct AudioManager {
@@ -227,6 +228,16 @@ impl AudioManager {
             // Note: Producer will need to be recreated after this
         }
     }
+    
+    /// Reset audio streams to clear any accumulated latency
+    pub fn reset_for_low_latency(&mut self) -> Result<Option<Arc<Mutex<HeapProducer<f32>>>>, AudioError> {
+        if self.is_playing() {
+            self.stop_playback();
+            // Restart playback with fresh buffers
+            return Ok(Some(self.start_playback()?));
+        }
+        Ok(None)
+    }
 }
 
 impl Drop for AudioManager {
@@ -235,21 +246,27 @@ impl Drop for AudioManager {
     }
 }
 
-/// Helper function to convert f32 samples to bytes for transmission
+/// Helper function to convert f32 samples to compressed bytes for transmission
 pub fn samples_to_bytes(samples: &[f32]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(samples.len() * 4);
+    // Use 16-bit compression instead of 32-bit for network efficiency
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
     for sample in samples {
-        bytes.extend_from_slice(&sample.to_le_bytes());
+        // Convert f32 (-1.0 to 1.0) to i16 (-32768 to 32767)
+        let compressed = (*sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        bytes.extend_from_slice(&compressed.to_le_bytes());
     }
     bytes
 }
 
-/// Helper function to convert bytes to f32 samples for playback
+/// Helper function to convert compressed bytes back to f32 samples for playback
 pub fn bytes_to_samples(bytes: &[u8]) -> Vec<f32> {
-    let mut samples = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
+    let mut samples = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
         if let Ok(array) = chunk.try_into() {
-            samples.push(f32::from_le_bytes(array));
+            // Convert i16 back to f32 (-1.0 to 1.0)
+            let compressed = i16::from_le_bytes(array);
+            let sample = compressed as f32 / 32767.0;
+            samples.push(sample);
         }
     }
     samples
